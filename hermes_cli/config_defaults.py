@@ -1908,13 +1908,17 @@ DEFAULT_CONFIG = {
         # on a 1 GiB VM. On hosts where total memory can't be read (macOS/Windows), unset falls back to no
         # cap. Set an explicit value to override the derived default in either direction.
         "max_in_progress": None,
-        # Per-profile cap: positive int = no single profile runs more than N workers even if the
-        # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
-        # when fan-out would saturate one profile's model/API quota/browser pool.
+        # Per-profile cap: positive int = no single profile runs more than N workers (counted across
+        # all boards) even if the global caps allow; blocked tasks defer to the next tick. A mapping
+        # caps per profile, e.g. {free-coder: 2, fast-coder: 8, default: 4}; "default" covers unlisted
+        # profiles, without it they are uncapped. None = no per-profile cap.
         # Unset (None) means "no per-profile cap" — backward-compatible with existing installs. Useful for
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
+        # Shared group caps across ALL boards: {name: {profiles: [...], max: N}}. Members share one
+        # running budget, e.g. every profile that hits the same local model server. None = no groups.
+        "group_caps": None,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a

@@ -1929,6 +1929,36 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
     board to one file) yields 0. Fails open per board.
     """
+    return sum(_for_other_boards(board, count_running_tasks))
+
+
+def running_by_assignee(conn: sqlite3.Connection) -> dict[str, int]:
+    """``running`` task count per assignee on one board."""
+    return {
+        row["assignee"]: int(row["n"])
+        for row in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        )
+    }
+
+
+def running_by_assignee_other_boards(board: Optional[str] = None) -> dict[str, int]:
+    """Per-assignee ``running`` counts across every board EXCEPT ``board``.
+
+    A profile's cap protects what the profile shares host-wide (one model
+    endpoint, one API quota), so its workers on other boards count too.
+    """
+    totals: dict[str, int] = {}
+    for counts in _for_other_boards(board, running_by_assignee):
+        for name, n in counts.items():
+            totals[name] = totals.get(name, 0) + n
+    return totals
+
+
+def _for_other_boards(board: Optional[str], fn: Callable[[sqlite3.Connection], Any]) -> list[Any]:
+    """``fn(conn)`` for every board DB except ``board``'s; fails open per board."""
     try:
         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
     except Exception:
@@ -1936,8 +1966,8 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
-        return 0
-    total = 0
+        return []
+    results: list[Any] = []
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
@@ -1949,13 +1979,60 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
                 continue
             other = _kbc.connect(board=slug)
             try:
-                total += count_running_tasks(other)
+                results.append(fn(other))
             finally:
                 with contextlib.suppress(Exception):
                     other.close()
         except Exception:
             continue
-    return total
+    return results
+
+
+def resolve_per_profile_cap(value: Any) -> Optional[Callable[[str], Optional[int]]]:
+    """``kanban.max_in_progress_per_profile`` as ``assignee -> cap`` (None = uncapped).
+
+    A positive int caps every profile alike. A mapping caps per profile
+    (``{fast-coder: 8, default: 2}``): profiles share one host but not one
+    budget, since a local-model lane has a hard slot count while a cloud lane
+    only has a quota. ``default`` covers unlisted profiles; without it they
+    are uncapped. Invalid entries are dropped. Returns None when nothing caps.
+    """
+    if isinstance(value, Mapping):
+        caps = {str(k): v for k, v in ((k, _positive_int(v, 0)) for k, v in value.items()) if v > 0}
+        if not caps:
+            return None
+        fallback = caps.pop("default", None)
+        return lambda name: caps.get(name, fallback)
+    cap = _positive_int(value, 0) if not isinstance(value, bool) else 0
+    if cap <= 0:
+        return None
+    return lambda name: cap
+
+
+def normalize_group_caps(raw: Any) -> list[tuple[str, frozenset, int]]:
+    """Parse ``kanban.group_caps`` into ``[(name, profiles, max)]``.
+
+    Accepts ``{name: {"profiles": [...], "max": N}}``. Invalid entries are
+    dropped; a group whose ``max`` is below 1 or whose profile list is empty
+    is ignored rather than blocking every spawn.
+    """
+    out: list[tuple[str, frozenset, int]] = []
+    if not isinstance(raw, Mapping):
+        return out
+    for name, spec in raw.items():
+        if not isinstance(spec, Mapping):
+            continue
+        profiles = spec.get("profiles")
+        if isinstance(profiles, str):
+            profiles = [p.strip() for p in profiles.split(",")]
+        try:
+            cap = int(spec.get("max"))
+        except (TypeError, ValueError):
+            continue
+        members = frozenset(p for p in (profiles or []) if isinstance(p, str) and p)
+        if cap >= 1 and members:
+            out.append((str(name), members, cap))
+    return out
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -1989,7 +2066,8 @@ def dispatch_once(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
-    max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile: Any = None,
+    group_caps: Optional[Mapping[str, Any]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -2013,6 +2091,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            group_caps=group_caps,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -2061,8 +2140,10 @@ def _dispatch_lane_task(
     board: Optional[str],
     failure_limit: int,
     spawn_fn,
-    per_profile_cap: Optional[int],
+    per_profile_cap: Optional[Callable[[str], Optional[int]]],
     per_profile_running: dict[str, int],
+    groups: Optional[list] = None,
+    group_running: Optional[dict] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2092,10 +2173,14 @@ def _dispatch_lane_task(
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
-    if per_profile_cap is not None:
+    if _at_profile_cap(assignee, per_profile_cap, per_profile_running):
         current = per_profile_running.get(assignee, 0)
-        if current >= per_profile_cap:
-            result.skipped_per_profile_capped.append((task_id, assignee, current))
+        result.skipped_per_profile_capped.append((task_id, assignee, current))
+        return False
+    for gname, members, gcap in (groups or ()):
+        if assignee in members and (group_running or {}).get(gname, 0) >= gcap:
+            result.skipped_per_profile_capped.append(
+                (task_id, assignee, (group_running or {}).get(gname, 0)))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
@@ -2117,6 +2202,9 @@ def _dispatch_lane_task(
         # ticks re-query from the DB.
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
+        for gname, members, _gcap in (groups or ()):
+            if name in members and group_running is not None:
+                group_running[gname] = group_running.get(gname, 0) + 1
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
@@ -2302,11 +2390,20 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _at_profile_cap(
+    assignee: str,
+    per_profile_cap: Optional[Callable[[str], Optional[int]]],
+    running: dict[str, int],
+) -> bool:
+    cap = per_profile_cap(assignee) if per_profile_cap is not None else None
+    return cap is not None and running.get(assignee, 0) >= cap
+
+
 def _any_spawnable_review(
     conn: sqlite3.Connection,
     review_rows: list[sqlite3.Row],
     *,
-    per_profile_cap: Optional[int] = None,
+    per_profile_cap: Optional[Callable[[str], Optional[int]]] = None,
     per_profile_running: Optional[dict[str, int]] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
@@ -2327,7 +2424,7 @@ def _any_spawnable_review(
             continue
         if profile_exists is not None and not profile_exists(assignee):
             continue
-        if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
+        if _at_profile_cap(assignee, per_profile_cap, running):
             continue
         if check_respawn_guard(conn, row["id"], lane="review") is None:
             return True
@@ -2364,7 +2461,8 @@ def _dispatch_once_locked(
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
-    max_in_progress_per_profile: Optional[int] = None,
+    max_in_progress_per_profile: Any = None,
+    group_caps: Optional[Mapping[str, Any]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -2391,22 +2489,25 @@ def _dispatch_once_locked(
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
     # review rows the lane loop would refuse this tick.
-    per_profile_cap = max_in_progress_per_profile if (
-        # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
-        # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
-        # workloads from melting a single profile's local model / API quota / browser pool while leaving
-        # other profiles idle.
-        isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
-    ) else None
+    # Per-profile concurrency cap (#21582): refuse to spawn when that would push an assignee past
+    # its cap, so a fan-out cannot melt one profile's local model / API quota / browser pool.
+    # Counted host-wide (all boards) for the same reason max_in_progress is.
+    per_profile_cap = resolve_per_profile_cap(max_in_progress_per_profile)
     per_profile_running: dict[str, int] = {}
     if per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            per_profile_running[prow["assignee"]] = int(prow["n"])
+        per_profile_running = running_by_assignee(conn)
+        for name, n in running_by_assignee_other_boards(board).items():
+            per_profile_running[name] = per_profile_running.get(name, 0) + n
+    # Shared group caps: members of a group (e.g. every profile that talks to
+    # the same local model server) share ONE budget across all boards.
+    groups = normalize_group_caps(group_caps)
+    group_running: dict[str, int] = {}
+    if groups:
+        combined = running_by_assignee(conn)
+        for name, n in running_by_assignee_other_boards(board).items():
+            combined[name] = combined.get(name, 0) + n
+        for gname, members, _gcap in groups:
+            group_running[gname] = sum(n for who, n in combined.items() if who in members)
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2421,6 +2522,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        groups=groups, group_running=group_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

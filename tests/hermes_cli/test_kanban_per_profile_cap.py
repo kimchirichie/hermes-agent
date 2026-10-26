@@ -108,3 +108,75 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert res2.spawned[0][0] != spawned_id  # different task this time
 
 
+
+
+def test_mapping_caps_each_profile_and_default_covers_the_rest(isolated_kanban_home_with_profiles):
+    """A mapping gives each profile its own cap; ``default`` applies to unlisted ones."""
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(5):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+        for i in range(5):
+            kb.create_task(conn, title=f"b{i}", assignee="beta")
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress_per_profile={"alpha": 3, "default": 1},
+        )
+    spawned = [s[1] for s in res.spawned]
+    assert spawned.count("alpha") == 3
+    assert spawned.count("beta") == 1
+
+
+def test_mapping_without_default_leaves_unlisted_profiles_uncapped(isolated_kanban_home_with_profiles):
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    with kbc.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(4):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            kb.create_task(conn, title=f"b{i}", assignee="beta")
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress_per_profile={"alpha": 1},
+        )
+    spawned = [s[1] for s in res.spawned]
+    assert spawned.count("alpha") == 1
+    assert spawned.count("beta") == 4
+
+
+def test_cap_counts_the_profiles_workers_on_other_boards(isolated_kanban_home_with_profiles):
+    """The cap protects a host-wide resource, so running work on another board uses it up."""
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
+    kb.create_board(slug="default", name="Test")
+    kb.create_board(slug="other", name="Other")
+    with kbc.connect_closing(board="other") as conn:
+        kb.create_task(conn, title="o0", assignee="alpha")
+        kbd.dispatch_once(conn, spawn_fn=_fake_spawn, board="other")
+        assert kbd.running_by_assignee(conn) == {"alpha": 1}
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress_per_profile={"alpha": 2},
+        )
+    assert [s[1] for s in res.spawned] == ["alpha"]
+
+
+def test_invalid_cap_values_are_ignored():
+    from hermes_cli.kanban_db_dispatch import resolve_per_profile_cap
+    assert resolve_per_profile_cap(None) is None
+    assert resolve_per_profile_cap(0) is None
+    assert resolve_per_profile_cap("x") is None
+    assert resolve_per_profile_cap({"alpha": 0, "beta": "x"}) is None
+    cap = resolve_per_profile_cap({"alpha": "2", "beta": -1})
+    assert cap("alpha") == 2 and cap("beta") is None
+    assert resolve_per_profile_cap(3)("anyone") == 3
