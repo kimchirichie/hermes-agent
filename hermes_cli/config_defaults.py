@@ -345,6 +345,11 @@ DEFAULT_CONFIG = {
         "daytona_image": DEFAULT_SANDBOX_IMAGE,
         "vercel_image": DEFAULT_VERCEL_IMAGE,  # vercel_sandbox backend only: a Vercel-managed or VCR image
         "vercel_runtime": "",  # deprecated by Vercel; a legacy runtime pin (node24 | node22 | python3.13) overrides vercel_image
+        # vercel_sandbox backend only: host path (absolute or relative to the profile home) to a bash
+        # script uploaded and run inside every fresh sandbox before the agent's first command.
+        # "" disables it. Credentials arrive as terminal.credential_files, never as arguments.
+        "vercel_setup_script": "",
+        "vercel_setup_timeout": 300,  # seconds; the setup script is killed and the task fails loudly
         # Container limits (docker, modal, daytona, vercel_sandbox, container plugin backends; not local/ssh).
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
