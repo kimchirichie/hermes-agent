@@ -30,7 +30,7 @@ from tools.environments.file_sync import FileSyncManager, iter_sync_files, quote
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from vercel.sandbox import Sandbox, SandboxStatus, WriteFile
+    from vercel.sandbox.sync import SandboxStatus, SyncSandbox, SyncSnapshot
 
 DEFAULT_VERCEL_CWD = "/vercel/sandbox"
 _DEFAULT_CONTAINER_DISK_MB = 51200
@@ -124,15 +124,22 @@ def _retry_vercel_call(label: str, callback, *, attempts: int):
 
 
 def _result_parts(result: Any) -> tuple[str, int]:
-    """(output, returncode) from an SDK command result; tolerates raw strings and older result shapes."""
-    try:
-        value = result.output()
-    except (AttributeError, TypeError):
-        value = result
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", errors="replace")
-    exit_code = getattr(result, "exit_code" if hasattr(result, "exit_code") else "returncode", None)
-    return ("" if value is None else str(value)), (exit_code if isinstance(exit_code, int) else 1)
+    """(output, returncode) from an SDK ``CompletedProcess``; tolerates raw strings.
+
+    The 0.12 sync SDK returns stdout/stderr separately (no ``output()`` helper),
+    so both streams are concatenated to keep the single-output contract.
+    """
+    if isinstance(result, str):
+        return result, 0
+    stdout, stderr = getattr(result, "stdout", None), getattr(result, "stderr", None)
+    parts: list[str] = []
+    for value in (stdout, stderr):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if value:
+            parts.append(str(value))
+    exit_code = getattr(result, "returncode", None)
+    return "".join(parts), (exit_code if isinstance(exit_code, int) else 1)
 
 
 def _snapshot_store() -> Path:
@@ -167,7 +174,7 @@ def _extract_snapshot_id(snapshot: Any) -> str | None:
 @cache
 def _sandbox_status_type() -> type[SandboxStatus]:
     _ensure_vercel_sdk()
-    from vercel.sandbox import SandboxStatus
+    from vercel.sandbox.sync import SandboxStatus
     return SandboxStatus
 
 
@@ -192,27 +199,27 @@ class VercelSandboxEnvironment(BaseEnvironment):
                 "Use the default shared setting.")
         self._persistent, self._task_id, self._requested_cwd = persistent_filesystem, task_id, cwd
         self._lock = threading.Lock()
-        self._sandbox: Sandbox | None = None
+        self._sandbox: SyncSandbox | None = None
         self._workspace_root = self._remote_home = DEFAULT_VERCEL_CWD
         self._sync_manager: FileSyncManager | None = None
         _ensure_vercel_sdk()
-        from vercel.sandbox import Resources
+        from vercel.sandbox.sync import SandboxResources
         vcpus, memory_mb = (math.floor(cpu) if cpu > 0 else None), (memory if memory > 0 else None)
-        # Vercel rejects runtime+image together; runtimes are deprecated (Aug 2026), so a runtime is
-        # only sent when the user still pins one, and then the image is dropped.
+        # Vercel deprecated runtimes (Aug 2026) and the 0.12 SDK no longer accepts one:
+        # a pinned runtime is logged and dropped, and the image is always sent instead.
         if runtime:
-            logger.warning("Vercel: terminal.vercel_runtime is deprecated by Vercel; set terminal.vercel_image "
-                           "(default %s) instead", DEFAULT_VERCEL_IMAGE)
+            logger.warning("Vercel: terminal.vercel_runtime is deprecated by Vercel and unsupported by "
+                           "vercel==0.12.0; ignoring %r and using terminal.vercel_image (default %s)",
+                           runtime, DEFAULT_VERCEL_IMAGE)
         self._create_kwargs = {
-            "timeout": max(timedelta(seconds=max(self.timeout, 0)), timedelta(minutes=5)),
-            "runtime": runtime or None,
-            "image": None if runtime else (image or DEFAULT_VERCEL_IMAGE),
-            "resources": Resources(vcpus=vcpus, memory=memory_mb) if (vcpus, memory_mb) != (None, None) else None}
+            "execution_time_limit": max(timedelta(seconds=max(self.timeout, 0)), timedelta(minutes=5)),
+            "image": image or DEFAULT_VERCEL_IMAGE,
+            "resources": SandboxResources(vcpus=vcpus, memory=memory_mb) if (vcpus, memory_mb) != (None, None) else None}
         self._attach_fresh_sandbox(cwd)
         self._sync_manager.sync(force=True)
         self.init_session()
 
-    def _require_sandbox(self) -> Sandbox:
+    def _require_sandbox(self) -> SyncSandbox:
         if self._sandbox is None:
             raise RuntimeError("Vercel sandbox is not attached")
         return self._sandbox
@@ -220,31 +227,31 @@ class VercelSandboxEnvironment(BaseEnvironment):
     def _remote_hermes_dir(self) -> str:
         return f"{self._remote_home.rstrip('/')}/.hermes"
 
-    def _create_sandbox(self) -> Sandbox:
+    def _create_sandbox(self) -> SyncSandbox:
         _ensure_vercel_sdk()
-        from vercel.sandbox import Sandbox
+        from vercel.sandbox.sync import SnapshotSource, create_sandbox
         snapshot_id = _load_snapshots().get(self._task_id) if self._persistent and self._task_id else None
         if isinstance(snapshot_id, str) and snapshot_id:
             try:
-                source = {"type": "snapshot", "snapshot_id": snapshot_id}
-                # A snapshot carries its own filesystem: Vercel refuses runtime with a snapshot
-                # source, and the image would describe a base the snapshot already replaced.
-                restore_kwargs = {k: v for k, v in self._create_kwargs.items() if k not in ("runtime", "image")}
+                source = SnapshotSource(snapshot_id=snapshot_id)
+                # A snapshot carries its own filesystem: the image would describe a base the
+                # snapshot already replaced, so it is dropped from the restore call.
+                restore_kwargs = {k: v for k, v in self._create_kwargs.items() if k != "image"}
                 return _retry_vercel_call(
-                    "sandbox restore", lambda: Sandbox.create(**restore_kwargs, source=source),
+                    "sandbox restore", lambda: create_sandbox(**restore_kwargs, source=source),
                     attempts=_CREATE_RETRY_ATTEMPTS)
             except Exception as exc:
                 logger.warning("Vercel: failed to restore snapshot %s for task %s; falling back to a fresh sandbox: %s",
                                snapshot_id, self._task_id, exc)
                 _delete_snapshot(self._task_id, snapshot_id)
-        return _retry_vercel_call("sandbox create", lambda: Sandbox.create(**self._create_kwargs),
+        return _retry_vercel_call("sandbox create", lambda: create_sandbox(**self._create_kwargs),
                                   attempts=_CREATE_RETRY_ATTEMPTS)
 
     def _attach_fresh_sandbox(self, requested_cwd: str) -> None:
         """Create a sandbox, wait until it runs, then wire cwd/home and the file sync manager."""
         self._sandbox = self._create_sandbox()
         self._wait_for_running()
-        cwd = self._require_sandbox().sandbox.cwd
+        cwd = self._require_sandbox().cwd or ""
         self._workspace_root = cwd if cwd.startswith("/") else DEFAULT_VERCEL_CWD
         self._remote_home = self._detect_remote_home()
         container_base = self._remote_hermes_dir()
@@ -258,7 +265,8 @@ class VercelSandboxEnvironment(BaseEnvironment):
 
     def _detect_remote_home(self) -> str:
         try:
-            result = self._require_sandbox().run_command("sh", ["-lc", 'printf %s "$HOME"'], cwd=self._workspace_root)
+            result = self._require_sandbox().run_process(
+                "sh", ["-lc", 'printf %s "$HOME"'], cwd=self._workspace_root, capture_output=True)
         except Exception as exc:
             logger.debug("Vercel: home detection failed for task %s: %s", self._task_id, exc)
             return self._workspace_root
@@ -266,35 +274,24 @@ class VercelSandboxEnvironment(BaseEnvironment):
         return home if home.startswith("/") else self._workspace_root
 
     def _wait_for_running(self, timeout: timedelta = _RUNNING_WAIT_TIMEOUT) -> None:
+        """Assert the sandbox is running; the 0.12 sync SDK's create/restore call already waits."""
+        del timeout  # the SDK blocks inside create_sandbox; there is no poll-until-ready helper
         sandbox, running = self._require_sandbox(), _sandbox_status_type().RUNNING
         status = sandbox.status
         if status is None or status == running:
             return
         if _is_terminal(status):
             raise RuntimeError(f"Sandbox entered terminal state: {status}")
-        try:
-            sandbox.wait_for_status(running, timeout=max(timeout, timedelta(seconds=1)),
-                                    poll_interval=timedelta(milliseconds=250))
-        except TimeoutError as exc:
-            status = sandbox.status
-            if _is_terminal(status):
-                raise RuntimeError(f"Sandbox entered terminal state: {status}") from exc
-            raise RuntimeError(f"Sandbox did not reach running state (last status: {status})") from exc
+        raise RuntimeError(f"Sandbox did not reach running state (last status: {status})")
 
     @staticmethod
-    def _close_sandbox_client(sandbox: Sandbox | None) -> None:
-        with contextlib.suppress(Exception):  # None sandbox -> AttributeError -> no-op
-            sandbox.client.close()
+    def _stop_sandbox(sandbox: SyncSandbox | None) -> None:
+        if sandbox is None:
+            return
+        with contextlib.suppress(Exception):
+            sandbox.stop()
 
-    @staticmethod
-    def _stop_sandbox(sandbox: Sandbox | None) -> None:
-        with contextlib.suppress(Exception):  # None sandbox -> AttributeError -> no-op
-            try:
-                sandbox.stop(blocking=True, timeout=timedelta(seconds=15), poll_interval=timedelta(milliseconds=500))
-            except TypeError:  # older SDKs: stop() takes no arguments
-                sandbox.stop()
-
-    def _snapshot_sandbox(self, sandbox: Sandbox) -> None:
+    def _snapshot_sandbox(self, sandbox: SyncSandbox) -> None:
         if not self._persistent or not self._task_id:
             return
         try:
@@ -309,12 +306,14 @@ class VercelSandboxEnvironment(BaseEnvironment):
         logger.info("Vercel: saved filesystem snapshot %s for task %s", snapshot_id, self._task_id)
 
     def _ensure_sandbox_ready(self) -> None:
-        """Reuse a healthy sandbox; recreate when refresh fails or it hit a terminal state."""
+        """Reuse a healthy sandbox; recreate when the refresh fails or it hit a terminal state."""
         sandbox = self._sandbox
         requested_cwd = self.cwd or self._requested_cwd or DEFAULT_VERCEL_CWD
         if sandbox is not None:
             try:
-                sandbox.refresh()
+                # 0.12 has no handle.refresh(); re-fetching by name is the equivalent read.
+                from vercel.sandbox.sync import get_sandbox
+                self._sandbox = sandbox = get_sandbox(name=sandbox.name)
             except Exception as exc:
                 logger.warning("Vercel: sandbox refresh failed for task %s: %s; recreating", self._task_id, exc)
             else:
@@ -323,23 +322,28 @@ class VercelSandboxEnvironment(BaseEnvironment):
                     self._wait_for_running()
                     return
                 logger.warning("Vercel: sandbox entered state %s for task %s; recreating", status, self._task_id)
-            self._close_sandbox_client(sandbox)
             self._mark_recreated()
         self._attach_fresh_sandbox(requested_cwd)
 
     def _run_checked(self, script: str, label: str) -> None:
         output, returncode = _result_parts(
-            self._require_sandbox().run_command("bash", ["-lc", script], cwd=self._workspace_root))
+            self._require_sandbox().run_process(
+                "bash", ["-lc", script], cwd=self._workspace_root, capture_output=True))
         if returncode != 0:
             raise RuntimeError(f"Vercel {label} failed: {output.strip()}")
 
     def _vercel_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         if not files:
             return
-        payload: list[WriteFile] = [
-            {"path": remote_path, "content": Path(host_path).read_bytes()} for host_path, remote_path in files]
+        payload = [(remote_path, Path(host_path).read_bytes()) for host_path, remote_path in files]
         sandbox = self._require_sandbox()
-        _retry_vercel_call("write_files", lambda: sandbox.write_files(payload), attempts=3)
+
+        def upload() -> None:
+            with sandbox.fs.batch() as batch:
+                for remote_path, content in payload:
+                    batch.write_bytes(remote_path, content)
+
+        _retry_vercel_call("write_files", upload, attempts=3)
 
     def _vercel_delete(self, remote_paths: list[str]) -> None:
         if remote_paths:
@@ -353,10 +357,12 @@ class VercelSandboxEnvironment(BaseEnvironment):
             # --exclude: live sockets cannot be archived ("socket ignored") and must not fail the download.
             self._run_checked(f"tar cf {shlex.quote(remote_tar)} --exclude='*.sock' -C / {shlex.quote(archive_member)}",
                               "bulk download")
-            sandbox.download_file(remote_tar, dest_tar_path)
+            # 0.12 exposes no download_file(); the archive is read back through the filesystem handle.
+            dest_tar_path.write_bytes(sandbox.fs.read_bytes(remote_tar))
         finally:
             with contextlib.suppress(Exception):
-                sandbox.run_command("bash", ["-lc", f"rm -f {shlex.quote(remote_tar)}"], cwd=self._workspace_root)
+                sandbox.run_process("bash", ["-lc", f"rm -f {shlex.quote(remote_tar)}"],
+                                    cwd=self._workspace_root, capture_output=True)
 
     def _before_execute(self) -> None:
         with self._lock:
@@ -380,7 +386,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
                 # sudo password). Once dispatched the user shell unlinks it
                 # itself, so kill() sends no extra command.
                 with contextlib.suppress(Exception):
-                    sandbox.write_files([{"path": state["staged"], "content": b"", "mode": 0o600}])
+                    sandbox.fs.write_bytes(state["staged"], b"", mode=0o600)
                 state["staged"] = None
 
         def cancel() -> None:
@@ -396,13 +402,10 @@ class VercelSandboxEnvironment(BaseEnvironment):
                     if state["cancelled"]:
                         return ("", 130)
                 remote_stdin = self._staged_stdin_path()
+                stdin_payload = stdin_data.encode("utf-8", "surrogateescape")
                 _retry_vercel_call(
                     "stdin upload",
-                    lambda: sandbox.write_files([{
-                        "path": remote_stdin,
-                        "content": stdin_data.encode("utf-8", "surrogateescape"),
-                        "mode": 0o600,
-                    }]),
+                    lambda: sandbox.fs.write_bytes(remote_stdin, stdin_payload, mode=0o600),
                     attempts=_WRITE_RETRY_ATTEMPTS,
                 )
                 command = self._redirect_stdin_from_file(cmd_string, remote_stdin)
@@ -414,8 +417,8 @@ class VercelSandboxEnvironment(BaseEnvironment):
                     scrub_staged()
                     return ("", 130)
                 state["dispatched"] = True
-            return _result_parts(sandbox.run_command(
-                "bash", ["-lc" if login else "-c", command], cwd=workspace_root))
+            return _result_parts(sandbox.run_process(
+                "bash", ["-lc" if login else "-c", command], cwd=workspace_root, capture_output=True))
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
 
     def cleanup(self):
@@ -433,4 +436,3 @@ class VercelSandboxEnvironment(BaseEnvironment):
         self._snapshot_sandbox(sandbox)
         # Always stop the sandbox during cleanup to avoid resource leaks (matches Modal/Daytona).
         self._stop_sandbox(sandbox)
-        self._close_sandbox_client(sandbox)
