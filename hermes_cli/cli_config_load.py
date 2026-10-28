@@ -86,6 +86,7 @@ _TERMINAL_ENV_MAPPINGS = {
     for key in (
         "degraded_mode", "cwd", "timeout", "home_mode", "lifetime_seconds", "docker_image",
         "docker_forward_env", "modal_image", "daytona_image", "vercel_runtime", "vercel_image",
+        "vercel_setup_script", "vercel_setup_timeout",
         "ssh_host", "ssh_user", "ssh_port", "ssh_key", "container_cpu", "container_memory",
         "container_disk", "container_persistent", "docker_volumes", "docker_env", "docker_extra_args",
         "docker_shm_size", "docker_mount_cwd_to_workspace", "docker_network", "docker_run_as_host_user",

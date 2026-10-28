@@ -848,6 +848,8 @@ def _get_env_config() -> dict[str, Any]:
         "daytona_image": _tenv("TERMINAL_DAYTONA_IMAGE", default_image),
         "vercel_runtime": _tenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "vercel_image": _tenv("TERMINAL_VERCEL_IMAGE", "").strip(),
+        "vercel_setup_script": _tenv("TERMINAL_VERCEL_SETUP_SCRIPT", "").strip(),
+        "vercel_setup_timeout": _parse_env_var("TERMINAL_VERCEL_SETUP_TIMEOUT", "300"),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,

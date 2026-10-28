@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import os
 import re
 import sys
 import tarfile
@@ -68,6 +69,7 @@ class _FakeFilesystem:
 
     def _record(self, files: list[dict[str, object]]) -> None:
         self._sandbox.write_files_calls.append(files)
+        self._sandbox.events.append(("upload", tuple(str(f.get("path")) for f in files)))
         if self._sandbox.write_files_side_effects:
             effect = self._sandbox.write_files_side_effects.pop(0)
             if isinstance(effect, Exception):
@@ -109,6 +111,7 @@ class _FakeSandbox:
         self.status = status
         self.home = home
         self.fs = _FakeFilesystem(self)
+        self.events: list[tuple[str, object]] = []
         self.run_process_calls: list[tuple[str, list[str], dict]] = []
         self.run_process_side_effects: list[object] = []
         self.write_files_calls: list[list[dict[str, object]]] = []
@@ -124,6 +127,7 @@ class _FakeSandbox:
     def run_process(self, cmd: str, args: list[str] | None = None, **kwargs):
         args = list(args or [])
         self.run_process_calls.append((cmd, args, kwargs))
+        self.events.append(("run", args[1] if len(args) > 1 else ""))
         if self.run_process_side_effects:
             effect = self.run_process_side_effects.pop(0)
             if isinstance(effect, Exception):
@@ -685,3 +689,179 @@ class TestImageSelection:
         restore = vercel_sdk.create_kwargs[-1]
         assert restore["source"].snapshot_id == "snap_saved"
         assert "runtime" not in restore and "image" not in restore
+
+
+class TestSetupScript:
+    """``terminal.vercel_setup_script``: a loud, ordered pre-launch hook, run once per fresh box."""
+
+    @staticmethod
+    def _write_script(tmp_path, body: str = "#!/bin/bash\necho ready\n"):
+        script = tmp_path / "setup.sh"
+        script.write_text(body)
+        return script
+
+    @staticmethod
+    def _setup_runs(sandbox, remote: str) -> list[int]:
+        return [i for i, (kind, script) in enumerate(sandbox.events)
+                if kind == "run" and remote in str(script)]
+
+    @staticmethod
+    def _init_session_runs(sandbox) -> list[int]:
+        return [i for i, (kind, script) in enumerate(sandbox.events)
+                if kind == "run" and "__HERMES_CWD_" in str(script)]
+
+    @staticmethod
+    def _setup_uploads(sandbox, remote: str) -> list[dict[str, object]]:
+        return [f for files in sandbox.write_files_calls for f in files if f["path"] == remote]
+
+    def test_unset_setup_script_makes_no_extra_call(self, make_env, vercel_module, vercel_sdk):
+        env = make_env()
+        sandbox = vercel_sdk.current
+        remote = vercel_module._SETUP_SCRIPT_REMOTE
+
+        assert env._setup_script is None
+        assert self._setup_uploads(sandbox, remote) == []
+        assert self._setup_runs(sandbox, remote) == []
+        # Unchanged behaviour: home detection, then init_session, and nothing else.
+        runs = [script for kind, script in sandbox.events if kind == "run"]
+        assert len(runs) == 2
+        assert "__HERMES_CWD_" in runs[-1]
+
+    def test_setup_script_uploaded_and_run_before_init_session(
+        self, make_env, vercel_module, vercel_sdk, tmp_path
+    ):
+        script = self._write_script(tmp_path, "#!/bin/bash\ngit clone https://example.test/repo\n")
+        make_env(setup_script=str(script))
+        sandbox = vercel_sdk.current
+        remote = vercel_module._SETUP_SCRIPT_REMOTE
+
+        uploads = self._setup_uploads(sandbox, remote)
+        assert len(uploads) == 1
+        assert uploads[0]["content"] == script.read_bytes()
+
+        upload_at = sandbox.events.index(("upload", (remote,)))
+        setup_runs, init_runs = self._setup_runs(sandbox, remote), self._init_session_runs(sandbox)
+        assert len(setup_runs) == 1 and len(init_runs) == 1
+        assert upload_at < setup_runs[0] < init_runs[0]
+
+    def test_failing_setup_raises_and_leaves_no_half_set_up_box(
+        self, make_env, vercel_module, vercel_sdk, tmp_path
+    ):
+        script = self._write_script(tmp_path)
+        sandbox = _FakeSandbox()
+        sandbox.run_process_side_effects.extend(
+            [_FakeRunResult(sandbox.home), _FakeRunResult("fatal: could not clone", returncode=128)]
+        )
+        vercel_sdk.create_side_effects.append(sandbox)
+
+        with pytest.raises(RuntimeError, match="Vercel setup failed: fatal: could not clone"):
+            make_env(setup_script=str(script))
+
+        assert len(sandbox.stop_calls) == 1, "a failed setup must not leave the sandbox running"
+        assert self._init_session_runs(sandbox) == [], "the box was never marked ready"
+
+    def test_recreate_runs_setup_again_on_the_new_box(
+        self, make_env, vercel_module, vercel_sdk, tmp_path
+    ):
+        script = self._write_script(tmp_path)
+        env = make_env(setup_script=str(script))
+        remote = vercel_module._SETUP_SCRIPT_REMOTE
+        first = vercel_sdk.current
+        assert len(self._setup_runs(first, remote)) == 1
+
+        first.status = _FakeSandboxStatus.STOPPED
+        replacement = _FakeSandbox()
+        replacement.run_process_side_effects.extend(
+            [_FakeRunResult(replacement.home), _FakeRunResult(""), _cwd_result("hello")]
+        )
+        vercel_sdk.create_side_effects.append(replacement)
+
+        result = env.execute("echo hello")
+
+        assert result["output"] == "hello\n"
+        assert len(self._setup_runs(replacement, remote)) == 1
+        assert len(self._setup_uploads(replacement, remote)) == 1
+
+    def test_setup_timeout_reaches_the_sdk_kill_after(
+        self, make_env, vercel_module, vercel_sdk, tmp_path
+    ):
+        script = self._write_script(tmp_path)
+        make_env(setup_script=str(script), setup_timeout=42)
+        remote = vercel_module._SETUP_SCRIPT_REMOTE
+
+        setup_calls = [call for call in vercel_sdk.current.run_process_calls
+                       if len(call[1]) > 1 and remote in call[1][1]]
+        assert len(setup_calls) == 1
+        cmd, args, kwargs = setup_calls[0]
+        assert cmd == "bash" and args[0] == "-lc"
+        assert kwargs["cwd"] == "/vercel/sandbox"
+        assert kwargs["kill_after"] == 42
+
+    def test_failure_output_is_tail_capped_and_carries_no_env_values(
+        self, make_env, vercel_module, vercel_sdk, tmp_path, monkeypatch, caplog
+    ):
+        secret = "ghp_SUPERSECRETVALUE"
+        token = tmp_path / "gh-token.env"
+        token.write_text(f"GH_TOKEN={secret}\n")
+        monkeypatch.setattr(
+            "tools.credential_files.get_credential_file_mounts",
+            lambda: [{"host_path": str(token),
+                      "container_path": "/root/.hermes/credentials/gh-token.env"}],
+        )
+        monkeypatch.setattr("tools.credential_files.iter_skills_files", lambda **kwargs: [])
+        monkeypatch.setattr("tools.credential_files.iter_cache_files", lambda **kwargs: [])
+        script = self._write_script(
+            tmp_path, '#!/bin/bash\nsource "$HOME/.hermes/credentials/gh-token.env"\ngit clone repo\n')
+        remote = vercel_module._SETUP_SCRIPT_REMOTE
+        noisy = ("x" * 20000) + "\nfatal: could not read Username for 'https://example.test'"
+        sandbox = _FakeSandbox()
+        sandbox.run_process_side_effects.extend(
+            [_FakeRunResult(sandbox.home), _FakeRunResult(noisy, returncode=1)]
+        )
+        vercel_sdk.create_side_effects.append(sandbox)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            make_env(setup_script=str(script))
+
+        message = str(excinfo.value)
+        assert message.startswith("Vercel setup failed: ")
+        assert message.rstrip().endswith("fatal: could not read Username for 'https://example.test'")
+        assert "…(truncated)…" in message
+        assert len(message) < vercel_module._SETUP_OUTPUT_TAIL + 200
+        # The script reads the credential from a mounted file; Hermes never passes or echoes it.
+        assert secret not in message
+        assert secret not in caplog.text
+        assert all(secret not in " ".join(args) for _cmd, args, _kw in sandbox.run_process_calls)
+        assert all(secret.encode() not in f["content"] for f in self._setup_uploads(sandbox, remote))
+
+
+class TestSetupScriptConfigBridge:
+    def test_config_bridge_parses_setup_keys_through_get_env_config(self, monkeypatch):
+        """config.yaml -> env bridge -> _get_env_config(), the real path terminal_tool reads."""
+        from hermes_constants import get_hermes_home
+        from tools import terminal_tool
+
+        home = get_hermes_home()
+        home.mkdir(parents=True, exist_ok=True)
+        config_path = home / "config.yaml"
+        config_path.write_text(
+            "terminal:\n"
+            "  backend: vercel_sandbox\n"
+            "  vercel_setup_script: scripts/clone.sh\n"
+            "  vercel_setup_timeout: 900\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+        for name in ("TERMINAL_ENV", "TERMINAL_CWD",
+                     "TERMINAL_VERCEL_SETUP_SCRIPT", "TERMINAL_VERCEL_SETUP_TIMEOUT"):
+            monkeypatch.delenv(name, raising=False)
+        try:
+            config = terminal_tool._get_env_config()
+        finally:
+            config_path.unlink(missing_ok=True)
+
+        assert config["env_type"] == "vercel_sandbox"
+        assert config["vercel_setup_script"] == "scripts/clone.sh"
+        assert config["vercel_setup_timeout"] == 900
+        assert os.environ["TERMINAL_VERCEL_SETUP_SCRIPT"] == "scripts/clone.sh"
+        assert os.environ["TERMINAL_VERCEL_SETUP_TIMEOUT"] == "900"

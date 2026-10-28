@@ -60,6 +60,21 @@ _RUNNING_WAIT_POLL_INTERVAL = timedelta(milliseconds=250)
 _STOP_TIMEOUT = timedelta(seconds=15)
 _STOP_POLL_INTERVAL = timedelta(milliseconds=500)
 _SNAPSHOT_STORE_NAME = "vercel_sandbox_snapshots.json"
+_SETUP_SCRIPT_REMOTE = "/tmp/hermes_vercel_setup.sh"
+_SETUP_OUTPUT_TAIL = 4000
+DEFAULT_VERCEL_SETUP_TIMEOUT = 300
+
+
+def _resolve_setup_script(raw: str) -> Path:
+    """Absolute host path, or one resolved against the profile home."""
+    path = Path(os.path.expanduser(raw.strip()))
+    return path if path.is_absolute() else get_hermes_home() / path
+
+
+def _tail_cap(text: str, limit: int | None) -> str:
+    if not limit or len(text) <= limit:
+        return text
+    return "…(truncated)…\n" + text[-limit:]
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -191,13 +206,16 @@ class VercelSandboxEnvironment(BaseEnvironment):
     def __init__(self, runtime: str | None = None, cwd: str = DEFAULT_VERCEL_CWD, timeout: int = 60,
                  cpu: float = 1, memory: int = 5120, disk: int = _DEFAULT_CONTAINER_DISK_MB,
                  persistent_filesystem: bool = True, task_id: str = "default",
-                 image: str | None = None):
+                 image: str | None = None, setup_script: str | None = None,
+                 setup_timeout: int = DEFAULT_VERCEL_SETUP_TIMEOUT):
         super().__init__(cwd=cwd, timeout=timeout)
         if disk not in {0, _DEFAULT_CONTAINER_DISK_MB}:
             raise ValueError(
                 "Vercel Sandbox does not support configurable container_disk. "
                 "Use the default shared setting.")
         self._persistent, self._task_id, self._requested_cwd = persistent_filesystem, task_id, cwd
+        self._setup_script = (setup_script or "").strip() or None
+        self._setup_timeout = setup_timeout
         self._lock = threading.Lock()
         self._sandbox: SyncSandbox | None = None
         self._workspace_root = self._remote_home = DEFAULT_VERCEL_CWD
@@ -216,7 +234,6 @@ class VercelSandboxEnvironment(BaseEnvironment):
             "image": image or DEFAULT_VERCEL_IMAGE,
             "resources": SandboxResources(vcpus=vcpus, memory=memory_mb) if (vcpus, memory_mb) != (None, None) else None}
         self._attach_fresh_sandbox(cwd)
-        self._sync_manager.sync(force=True)
         self.init_session()
 
     def _require_sandbox(self) -> SyncSandbox:
@@ -248,7 +265,8 @@ class VercelSandboxEnvironment(BaseEnvironment):
                                   attempts=_CREATE_RETRY_ATTEMPTS)
 
     def _attach_fresh_sandbox(self, requested_cwd: str) -> None:
-        """Create a sandbox, wait until it runs, then wire cwd/home and the file sync manager."""
+        """Create a sandbox, wait until it runs, then wire cwd/home, sync the managed files and
+        run the optional setup script before any session is initialised."""
         self._sandbox = self._create_sandbox()
         self._wait_for_running()
         cwd = self._require_sandbox().cwd or ""
@@ -262,6 +280,27 @@ class VercelSandboxEnvironment(BaseEnvironment):
             bulk_upload_fn=self._vercel_bulk_upload, bulk_download_fn=self._vercel_bulk_download)
         self.cwd = {"~": self._remote_home, "": self._workspace_root,
                     DEFAULT_VERCEL_CWD: self._workspace_root}.get(requested_cwd, requested_cwd)
+        self._sync_manager.sync(force=True)
+        self._run_setup_script()
+
+    def _run_setup_script(self) -> None:
+        """Upload and run terminal.vercel_setup_script once per fresh sandbox; it must be re-runnable."""
+        if not self._setup_script:
+            return
+        host_path = _resolve_setup_script(self._setup_script)
+        try:
+            host_path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"Vercel setup failed: cannot read {host_path}: {exc}") from exc
+        self._vercel_bulk_upload([(str(host_path), _SETUP_SCRIPT_REMOTE)])
+        try:
+            self._run_checked(f"bash {shlex.quote(_SETUP_SCRIPT_REMOTE)}", "setup",
+                              tail=_SETUP_OUTPUT_TAIL, timeout=self._setup_timeout)
+        except Exception:
+            # Construction raises, so cleanup() never runs: stop the half-set-up box here.
+            self._stop_sandbox(self._sandbox)
+            self._sandbox = None
+            raise
 
     def _detect_remote_home(self) -> str:
         try:
@@ -325,12 +364,16 @@ class VercelSandboxEnvironment(BaseEnvironment):
             self._mark_recreated()
         self._attach_fresh_sandbox(requested_cwd)
 
-    def _run_checked(self, script: str, label: str) -> None:
+    def _run_checked(self, script: str, label: str, *, tail: int | None = None,
+                     timeout: int | None = None) -> None:
+        """Run *script* under ``bash -lc``; ``timeout`` maps to the SDK's ``kill_after`` seconds."""
+        kwargs = {"cwd": self._workspace_root, "capture_output": True}
+        if timeout is not None:
+            kwargs["kill_after"] = timeout
         output, returncode = _result_parts(
-            self._require_sandbox().run_process(
-                "bash", ["-lc", script], cwd=self._workspace_root, capture_output=True))
+            self._require_sandbox().run_process("bash", ["-lc", script], **kwargs))
         if returncode != 0:
-            raise RuntimeError(f"Vercel {label} failed: {output.strip()}")
+            raise RuntimeError(f"Vercel {label} failed: {_tail_cap(output.strip(), tail)}")
 
     def _vercel_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         if not files:

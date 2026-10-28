@@ -60,6 +60,7 @@ _RESOURCE_KEYS = (("cpu", "container_cpu", 1), ("memory", "container_memory", 51
 _CONTAINER_KEYS = (
     ("container_cpu", 1), ("container_memory", 5120), ("container_disk", 51200),
     ("container_persistent", True), ("modal_mode", "auto"), ("vercel_runtime", ""), ("vercel_image", ""),
+    ("vercel_setup_script", ""), ("vercel_setup_timeout", 300),
     ("docker_volumes", []), ("docker_mount_cwd_to_workspace", False), ("docker_forward_env", []),
     ("docker_env", {}), ("docker_run_as_host_user", False), ("docker_extra_args", []),
     ("docker_shm_size", "1g"), ("docker_network", True), ("docker_persist_across_processes", True),
@@ -186,7 +187,9 @@ _SANDBOX_ROWS = {
                 lambda cc, kw: {"cpu": int(kw["cpu"])}),
     "vercel_sandbox": (lambda: importlib.import_module("tools.environments.vercel_sandbox").VercelSandboxEnvironment,
                        False, lambda cc, kw: {"runtime": cc.get("vercel_runtime") or None,
-                                       "image": cc.get("vercel_image") or None}),
+                                       "image": cc.get("vercel_image") or None,
+                                       "setup_script": cc.get("vercel_setup_script") or None,
+                                       "setup_timeout": cc.get("vercel_setup_timeout", 300)}),
 }
 
 
