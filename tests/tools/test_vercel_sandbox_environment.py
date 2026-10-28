@@ -865,3 +865,115 @@ class TestSetupScriptConfigBridge:
         assert config["vercel_setup_timeout"] == 900
         assert os.environ["TERMINAL_VERCEL_SETUP_SCRIPT"] == "scripts/clone.sh"
         assert os.environ["TERMINAL_VERCEL_SETUP_TIMEOUT"] == "900"
+
+
+class TestToolDefaultCwd:
+    """The terminal tool's default cwd for ``vercel_sandbox`` must follow the sandbox's own directory.
+
+    The stock image's working directory and HOME are ``/vercel`` and ``/vercel/sandbox`` does not exist,
+    so a literal default wrapped every command that omitted ``workdir`` in ``cd /vercel/sandbox`` and it
+    died with exit 126. ``~`` is expanded by the backend against the sandbox's detected HOME, so it is
+    right on this image and on any future one whose home differs.
+    """
+
+    @staticmethod
+    def _tool_default() -> str:
+        from tools import terminal_tool
+
+        return terminal_tool._backend_default_cwd("vercel_sandbox")
+
+    def test_default_is_the_sandbox_home_not_a_literal(self, monkeypatch):
+        from tools import terminal_tool
+
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+        assert self._tool_default() == "~"
+        assert terminal_tool._resolve_config_cwd("vercel_sandbox", False) == ("~", None)
+
+    def test_shipped_config_default_falls_back_to_the_sandbox_home(self, monkeypatch):
+        """``DEFAULT_CONFIG['terminal']['cwd']`` is ``"."``: a relative host path no sandbox can cd
+        into, so it must resolve to the backend default — not to the dead ``/vercel/sandbox`` literal."""
+        from tools import terminal_tool
+
+        monkeypatch.setenv("TERMINAL_CWD", ".")
+
+        assert terminal_tool._resolve_config_cwd("vercel_sandbox", False) == ("~", None)
+
+    def test_explicit_cwd_is_honoured(self, monkeypatch):
+        from tools import terminal_tool
+
+        monkeypatch.setenv("TERMINAL_CWD", "/tmp")
+
+        assert terminal_tool._resolve_config_cwd("vercel_sandbox", False) == ("/tmp", None)
+
+    def test_legacy_literal_still_reaches_the_real_workspace_root(self, make_env, vercel_sdk, monkeypatch):
+        """A profile that explicitly set ``terminal.cwd: /vercel/sandbox`` keeps working: the backend
+        maps the legacy literal to the sandbox's real workspace root instead of the missing path."""
+        from tools import terminal_tool
+
+        monkeypatch.setenv("TERMINAL_CWD", "/vercel/sandbox")
+        assert terminal_tool._resolve_config_cwd("vercel_sandbox", False) == ("/vercel/sandbox", None)
+
+        sandbox = _FakeSandbox(cwd="/vercel", home="/vercel")
+        vercel_sdk.create_side_effects.append(sandbox)
+
+        env = make_env(cwd="/vercel/sandbox")
+
+        assert env.cwd == "/vercel"
+
+    def test_default_cwd_resolves_to_the_real_sandbox_dir(self, make_env, vercel_sdk):
+        sandbox = _FakeSandbox(cwd="/vercel", home="/vercel")
+        vercel_sdk.create_side_effects.append(sandbox)
+
+        env = make_env(cwd=self._tool_default())
+
+        assert env.cwd == "/vercel"
+
+    def test_default_cwd_still_works_on_an_image_whose_cwd_is_the_old_literal(self, make_env, vercel_sdk):
+        sandbox = _FakeSandbox(cwd="/vercel/sandbox", home="/vercel/sandbox")
+        vercel_sdk.create_side_effects.append(sandbox)
+
+        env = make_env(cwd=self._tool_default())
+
+        assert env.cwd == "/vercel/sandbox"
+
+    def test_default_cwd_wraps_the_command_with_tilde(self, make_env, vercel_sdk, monkeypatch):
+        """The per-command ``cd`` must be ``~`` (expanded in the sandbox), never the dead literal."""
+        from tools import terminal_tool
+
+        sandbox = _FakeSandbox(cwd="/vercel", home="/vercel")
+        vercel_sdk.create_side_effects.append(sandbox)
+        env = make_env(cwd=self._tool_default())
+        monkeypatch.setattr(terminal_tool, "get_session_cwd", lambda _key: None)
+        command_cwd = terminal_tool._resolve_command_cwd(
+            workdir=None, default_cwd=self._tool_default(), session_key="tool-default",
+            env_type="vercel_sandbox", env=env)
+        sandbox.run_process_side_effects.append(_cwd_result(cwd="/vercel"))
+
+        env.execute("pwd", cwd=command_cwd)
+
+        assert command_cwd == "~"
+        scripts = [args[1] for _cmd, args, _kw in sandbox.run_process_calls if len(args) > 1]
+        cd_lines = [line for script in scripts for line in script.splitlines()
+                    if line.startswith("builtin cd --")]
+        assert cd_lines, scripts
+        assert cd_lines[-1] == "builtin cd -- ~ || exit 126", cd_lines
+        assert "/vercel/sandbox" not in cd_lines[-1]
+
+    def test_create_environment_through_the_terminal_tool_path(self, vercel_module, vercel_sdk, monkeypatch):
+        """The exact path the terminal tool takes: resolve the config cwd, then build the backend."""
+        from tools import terminal_tool
+        from tools.terminal_tool_backends import _create_environment
+
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        cwd, host_cwd = terminal_tool._resolve_config_cwd("vercel_sandbox", False)
+        sandbox = _FakeSandbox(cwd="/vercel", home="/vercel")
+        vercel_sdk.create_side_effects.append(sandbox)
+
+        env = _create_environment("vercel_sandbox", image="", cwd=cwd, timeout=30, task_id="tool-default")
+        try:
+            assert host_cwd is None
+            assert env.cwd == "/vercel"
+        finally:
+            env.cleanup()
+

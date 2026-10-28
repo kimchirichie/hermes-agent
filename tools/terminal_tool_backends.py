@@ -47,7 +47,14 @@ def terminal_backend_unavailable_reason() -> Optional[str]:
     return _last_unavailable_reason
 
 
-_VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
+# Where a vercel_sandbox terminal call starts when it omits workdir: the sandbox's OWN home ("~"),
+# never a literal. The stock image (vercel/sandbox/universal, Ubuntu 26.04) has working directory and
+# HOME /vercel; /vercel/sandbox does not exist, so a hardcoded default wrapped every command in
+# `cd /vercel/sandbox` and it died with exit 126. VercelSandboxEnvironment expands "~" to the
+# sandbox's detected HOME (_attach_fresh_sandbox), so this follows whatever image is configured.
+# A profile that explicitly sets terminal.cwd: /vercel/sandbox still works: the backend maps the
+# legacy literal (DEFAULT_VERCEL_CWD in tools/environments/vercel_sandbox.py) to the real workspace root.
+_VERCEL_SANDBOX_DEFAULT_CWD = "~"
 _SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
 _BUILTIN_BACKENDS = "local, docker, modal, daytona, vercel_sandbox, ssh"
 
