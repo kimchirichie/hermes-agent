@@ -227,17 +227,63 @@ def _tar_bytes(entries: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+class _FakeCredentials:
+    def __init__(self, token, team_id, project_id):
+        self.token, self.team_id, self.project_id = token, team_id, project_id
+
+
+class _FakeServiceOptions:
+    def __init__(self, credentials_factory=None, **_kw):
+        self.credentials_factory = credentials_factory
+
+
+class _FakeClient:
+    """Stand-in for ``SyncSandboxClient``: the credentials arrive through the factory, never os.environ."""
+    instances: list = []
+
+    def __init__(self, sdk, options):
+        self._sdk, self.options, self.closed = sdk, options, False
+        _FakeClient.instances.append(self)
+
+    @classmethod
+    def factory(cls, sdk):
+        def create(*, options=None, **_kw):
+            return cls(sdk, options)
+        return create
+
+    def resolved_credentials(self):
+        return self.options.credentials_factory()
+
+    def create_sandbox(self, **kwargs):
+        self.resolved_credentials()
+        return self._sdk.create_sandbox(**kwargs)
+
+    def get_sandbox(self, *, name):
+        self.resolved_credentials()
+        return self._sdk.get_sandbox(name=name)
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture()
 def vercel_sdk(monkeypatch):
     fake_sdk = _FakeSDK()
+    _FakeClient.instances = []
+    for name in ("VERCEL_TOKEN", "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("agent.secret_scope.get_secret",
+                        lambda name, default=None: {"VERCEL_TOKEN": "tok-A", "VERCEL_PROJECT_ID": "prj-A",
+                                                    "VERCEL_TEAM_ID": "team-A"}.get(name, default))
     sync_mod = types.ModuleType("vercel.sandbox.sync")
     sync_mod.SyncSandbox = object
     sync_mod.SyncSnapshot = object
     sync_mod.SandboxResources = _FakeResources
     sync_mod.SandboxStatus = _FakeSandboxStatus
     sync_mod.SnapshotSource = _FakeSnapshotSource
-    sync_mod.create_sandbox = fake_sdk.create_sandbox
-    sync_mod.get_sandbox = fake_sdk.get_sandbox
+    sync_mod.SandboxCredentials = _FakeCredentials
+    sync_mod.SandboxServiceOptions = _FakeServiceOptions
+    sync_mod.SyncSandboxClient = types.SimpleNamespace(create=_FakeClient.factory(fake_sdk))
 
     sandbox_mod = types.ModuleType("vercel.sandbox")
     sandbox_mod.sync = sync_mod
@@ -977,3 +1023,61 @@ class TestToolDefaultCwd:
         finally:
             env.cleanup()
 
+
+class TestVercelProfileScopedCredentials:
+    """The vercel SDK reads credentials only from os.environ. A multiplexing gateway keeps a
+    profile's .env in a context-local secret scope instead, so the backend must hand the SDK the
+    scoped values explicitly and must never write them into os.environ."""
+
+    def _env(self, vercel_module):
+        return vercel_module.VercelSandboxEnvironment(
+            cwd="/vercel/sandbox", timeout=60, persistent_filesystem=False, task_id="t")
+
+    def test_credentials_come_from_the_scope_when_environ_has_none(self, vercel_module):
+        env = self._env(vercel_module)
+        creds = _FakeClient.instances[-1].resolved_credentials()
+        assert (creds.token, creds.team_id, creds.project_id) == ("tok-A", "team-A", "prj-A")
+        env.cleanup()
+
+    def test_os_environ_is_never_written(self, vercel_module):
+        env = self._env(vercel_module)
+        for name in ("VERCEL_TOKEN", "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID"):
+            assert name not in os.environ
+        env.cleanup()
+
+    def test_missing_credential_names_the_variable_and_hides_values(self, vercel_module, monkeypatch):
+        monkeypatch.setattr("agent.secret_scope.get_secret",
+                            lambda name, default=None: None if name == "VERCEL_TEAM_ID" else "secret-value")
+        with pytest.raises(RuntimeError) as exc:
+            self._env(vercel_module)
+        assert "VERCEL_TEAM_ID" in str(exc.value)
+        assert "secret-value" not in str(exc.value)
+
+    def test_two_profiles_on_two_threads_never_see_each_others_token(self, vercel_module, monkeypatch):
+        import threading
+        scopes = {"A": {"VERCEL_TOKEN": "tok-A", "VERCEL_PROJECT_ID": "prj-A", "VERCEL_TEAM_ID": "team-A"},
+                  "B": {"VERCEL_TOKEN": "tok-B", "VERCEL_PROJECT_ID": "prj-B", "VERCEL_TEAM_ID": "team-B"}}
+        local = threading.local()
+        monkeypatch.setattr("agent.secret_scope.get_secret",
+                            lambda name, default=None: scopes[local.profile].get(name, default))
+        seen, gate = {}, threading.Barrier(2)
+
+        def run(profile):
+            local.profile = profile
+            gate.wait()
+            env = self._env(vercel_module)
+            seen[profile] = _FakeClient.instances[-1] if False else env._vercel_client().resolved_credentials()
+            env.cleanup()
+
+        threads = [threading.Thread(target=run, args=(p,)) for p in ("A", "B")]
+        [t.start() for t in threads]; [t.join() for t in threads]
+        assert (seen["A"].token, seen["A"].project_id) == ("tok-A", "prj-A")
+        assert (seen["B"].token, seen["B"].project_id) == ("tok-B", "prj-B")
+
+    def test_refresh_and_cleanup_use_the_same_scoped_client(self, vercel_module, vercel_sdk):
+        env = self._env(vercel_module)
+        client = env._vercel_client()
+        env._ensure_sandbox_ready()
+        assert env._vercel_client() is client and vercel_sdk.get_sandbox_calls
+        env.cleanup()
+        assert client.closed is True

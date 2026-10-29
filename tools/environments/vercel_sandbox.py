@@ -52,6 +52,35 @@ def _ensure_vercel_sdk() -> None:
         _lazy_ensure("vercel")
     except Exception as e:
         raise ImportError(str(e))
+_VERCEL_CREDENTIAL_ENV = ("VERCEL_TOKEN", "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID")
+
+
+def _resolve_vercel_credentials() -> tuple[str, str, str]:
+    """(token, team_id, project_id) for the profile serving THIS task.
+
+    The vercel SDK reads these only from os.environ, but a multiplexing gateway keeps each
+    profile's .env in a context-local secret scope and never writes it to os.environ (that
+    would leak one profile's keys into another's turn). Resolve through the scope instead,
+    and hand the values to the SDK as an explicit credentials factory (no os.environ write).
+    """
+    from agent.secret_scope import get_secret
+    values = {name: (get_secret(name) or "").strip() for name in _VERCEL_CREDENTIAL_ENV}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "Vercel sandbox credentials missing for this profile: set " + ", ".join(missing)
+            + " in the profile's .env (names only; values are never logged)")
+    return values["VERCEL_TOKEN"], values["VERCEL_TEAM_ID"], values["VERCEL_PROJECT_ID"]
+
+
+def _make_vercel_client():
+    """A SyncSandboxClient bound to this profile's credentials. Lazy, no I/O until first use."""
+    from vercel.sandbox.sync import SandboxCredentials, SandboxServiceOptions, SyncSandboxClient
+    token, team_id, project_id = _resolve_vercel_credentials()
+    credentials = SandboxCredentials(token=token, team_id=team_id, project_id=project_id)
+    return SyncSandboxClient.create(options=SandboxServiceOptions(credentials_factory=lambda: credentials))
+
+
 _WRITE_RETRY_ATTEMPTS = 3
 _RETRY_BACKOFF_STEP = timedelta(milliseconds=100)
 _MIN_SANDBOX_TIMEOUT = timedelta(minutes=5)
@@ -218,6 +247,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
         self._setup_timeout = setup_timeout
         self._lock = threading.Lock()
         self._sandbox: SyncSandbox | None = None
+        self._client = None
         self._workspace_root = self._remote_home = DEFAULT_VERCEL_CWD
         self._sync_manager: FileSyncManager | None = None
         _ensure_vercel_sdk()
@@ -244,9 +274,16 @@ class VercelSandboxEnvironment(BaseEnvironment):
     def _remote_hermes_dir(self) -> str:
         return f"{self._remote_home.rstrip('/')}/.hermes"
 
+    def _vercel_client(self):
+        """This environment's SDK client, built once from the profile-scoped credentials."""
+        if self._client is None:
+            self._client = _make_vercel_client()
+        return self._client
+
     def _create_sandbox(self) -> SyncSandbox:
         _ensure_vercel_sdk()
-        from vercel.sandbox.sync import SnapshotSource, create_sandbox
+        from vercel.sandbox.sync import SnapshotSource
+        client = self._vercel_client()
         snapshot_id = _load_snapshots().get(self._task_id) if self._persistent and self._task_id else None
         if isinstance(snapshot_id, str) and snapshot_id:
             try:
@@ -255,13 +292,13 @@ class VercelSandboxEnvironment(BaseEnvironment):
                 # snapshot already replaced, so it is dropped from the restore call.
                 restore_kwargs = {k: v for k, v in self._create_kwargs.items() if k != "image"}
                 return _retry_vercel_call(
-                    "sandbox restore", lambda: create_sandbox(**restore_kwargs, source=source),
+                    "sandbox restore", lambda: client.create_sandbox(**restore_kwargs, source=source),
                     attempts=_CREATE_RETRY_ATTEMPTS)
             except Exception as exc:
                 logger.warning("Vercel: failed to restore snapshot %s for task %s; falling back to a fresh sandbox: %s",
                                snapshot_id, self._task_id, exc)
                 _delete_snapshot(self._task_id, snapshot_id)
-        return _retry_vercel_call("sandbox create", lambda: create_sandbox(**self._create_kwargs),
+        return _retry_vercel_call("sandbox create", lambda: client.create_sandbox(**self._create_kwargs),
                                   attempts=_CREATE_RETRY_ATTEMPTS)
 
     def _attach_fresh_sandbox(self, requested_cwd: str) -> None:
@@ -351,8 +388,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
         if sandbox is not None:
             try:
                 # 0.12 has no handle.refresh(); re-fetching by name is the equivalent read.
-                from vercel.sandbox.sync import get_sandbox
-                self._sandbox = sandbox = get_sandbox(name=sandbox.name)
+                self._sandbox = sandbox = self._vercel_client().get_sandbox(name=sandbox.name)
             except Exception as exc:
                 logger.warning("Vercel: sandbox refresh failed for task %s: %s; recreating", self._task_id, exc)
             else:
@@ -479,3 +515,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
         self._snapshot_sandbox(sandbox)
         # Always stop the sandbox during cleanup to avoid resource leaks (matches Modal/Daytona).
         self._stop_sandbox(sandbox)
+        client, self._client = self._client, None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
