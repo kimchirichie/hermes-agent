@@ -94,12 +94,15 @@ def _unregister_env(task_id: str):
     Modal/Docker teardown can block 10-15s and would stall every concurrent
     terminal/file tool call."""
     from tools.terminal_tool import (
-        _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
-        _last_activity,
+        _active_environments, _creation_locks, _creation_locks_lock, _env_created_by, _env_lock,
+        _env_one_shot, _env_users, _last_activity,
     )
     with _env_lock:
         env = _active_environments.pop(task_id, None)
         _last_activity.pop(task_id, None)
+        _env_users.pop(task_id, None)
+        _env_created_by.pop(task_id, None)
+        _env_one_shot.pop(task_id, None)
     with _creation_locks_lock:
         _creation_locks.pop(task_id, None)
     return env
@@ -205,7 +208,7 @@ def ensure_task_env(task_id: Optional[str] = None):
     """
     from tools.terminal_tool import (
         _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
-        _get_env_config, _last_activity, _resolve_container_task_id,
+        _get_env_config, _last_activity, _note_env_user, _resolve_container_task_id,
         _resolve_task_host_cwd, _select_image, _start_cleanup_thread, resolve_task_overrides,
     )
     config = _get_env_config()
@@ -248,6 +251,7 @@ def ensure_task_env(task_id: Optional[str] = None):
         with _env_lock:
             _active_environments[effective_task_id] = new_env
             _last_activity[effective_task_id] = time.time()
+            _note_env_user(effective_task_id, task_id or effective_task_id, created=True)
         logger.info(
             "%s environment lazily initialized for task %s",
             env_type, effective_task_id[:8],
@@ -312,11 +316,63 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     )
 
 
+def release_run_env(task_id: Optional[str], *, session_ending: bool = False) -> bool:
+    """Stop the cloud-sandbox env a finished run created; True when one was released.
+
+    A cloud sandbox env is cached under the SESSION key (``session:<key>``) or the shared
+    ``"default"`` — never under the turn's own task id — so the per-turn ``cleanup_vm(task_id)``
+    could never find it: a long-lived gateway serving one-shot runs (``hermes -z``, the kanban
+    dispatcher) left the box running after the CLI exited 0, billable, until the idle reaper
+    (``terminal.lifetime_seconds``) or the platform's own execution_time_limit stopped it.
+
+    Every guard must pass before anything is stopped:
+      * the backend declares ``_release_when_run_finishes`` (a cloud sandbox whose filesystem is not
+        the task's state — Vercel today);
+      * the env is NOT persistent: a persistent filesystem IS the task's state, snapshotted at
+        cleanup and restored on the next create, so stopping it here would discard the task's work;
+      * no terminal call is in flight on it, and — unless the whole session is ending — this run
+        created it and no other run still uses it (a parent turn and its delegate children share
+        one session key; a conversation's later turns reuse the same env);
+      * the run is really over: *session_ending*, or an explicitly one-off turn. A live
+        conversation keeps its sandbox; the idle reaper covers it afterwards.
+    """
+    from tools.terminal_tool import (
+        _active_environments, _calls_in_flight, _env_created_by, _env_lock, _env_one_shot,
+        _env_users, _resolve_container_task_id, _run_is_one_shot_turn,
+    )
+    if not task_id:
+        return False
+    key = _resolve_container_task_id(task_id)
+    with _env_lock:
+        env = _active_environments.get(key)
+        if env is None:
+            return False
+        busy = _calls_in_flight.get(key, 0)
+        created_by = _env_created_by.get(key)
+        users = set(_env_users.get(key, ()))
+        # The env records whether its CREATOR was a one-off run (context is certainly available at
+        # creation); the live context is the fallback for an env cached before that was recorded.
+        one_shot = _env_one_shot.get(key)
+    if env is None or busy:
+        return False
+    if not session_ending and not (one_shot if one_shot is not None else _run_is_one_shot_turn()):
+        return False
+    if not getattr(env, "_release_when_run_finishes", False) or getattr(env, "_persistent", True):
+        return False
+    if not session_ending and (created_by != task_id or users - {task_id}):
+        return False
+    logger.info("Releasing the %s sandbox cached under %s for finished run %s",
+                getattr(env, "env_type", "cloud"), key, task_id)
+    cleanup_vm(key)
+    return True
+
+
 def _evict_environment_for_task(task_id: Optional[str]) -> None:
     """Drop any cached env for *task_id* (and its collapsed key) after an
     infrastructure failure, so later calls don't reuse a dead connection."""
     from tools.terminal_tool import (
-        _active_environments, _env_lock, _last_activity, _resolve_container_task_id,
+        _active_environments, _env_created_by, _env_lock, _env_one_shot, _env_users, _last_activity,
+        _resolve_container_task_id,
     )
     keys = {_resolve_container_task_id(task_id)}
     if task_id:
@@ -326,6 +382,9 @@ def _evict_environment_for_task(task_id: Optional[str]) -> None:
         for key in keys:
             env = _active_environments.pop(key, None)
             _last_activity.pop(key, None)
+            _env_users.pop(key, None)
+            _env_created_by.pop(key, None)
+            _env_one_shot.pop(key, None)
             if env is not None:
                 evicted.append(env)
     for env in evicted:

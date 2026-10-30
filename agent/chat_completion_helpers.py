@@ -2352,6 +2352,16 @@ def cleanup_task_resources(agent, task_id: str) -> None:
         except Exception as e:
             if agent.verbose_logging:
                 logger.warning("Failed to cleanup %s for task %s: %s", label, task_id, e)
+    # The cleanup above addresses the env by the TURN's id, which is not the key a cloud sandbox is
+    # cached under (a session key or "default"), so a one-off run that exits 0 used to leave its box
+    # running for the idle-reaper window. release_run_env() stops it when this really was the run's
+    # own, non-persistent sandbox; it is a no-op for every local/docker/persistent backend.
+    try:
+        from tools.terminal_tool_lifecycle import release_run_env
+        release_run_env(task_id)
+    except Exception as e:
+        if agent.verbose_logging:
+            logger.warning("Failed to release cloud sandbox for task %s: %s", task_id, e)
 
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,

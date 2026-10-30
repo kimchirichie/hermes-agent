@@ -727,7 +727,10 @@ class TestImageSelection:
         assert all("runtime" not in kwargs for kwargs in (fresh, custom, pinned))
         # ``timeout`` -> ``execution_time_limit`` (floored at Vercel's 5-minute minimum).
         assert fresh["execution_time_limit"] == timedelta(minutes=5)
-        assert fresh["resources"] == _FakeResources(vcpus=1, memory=5120)
+        # The shared defaults (cpu 1, memory 5120) are ILLEGAL at Vercel (memory must be
+        # vcpus * 2048), so the backend derives the memory the API accepts instead of failing
+        # every create with HTTP 400.
+        assert fresh["resources"] == _FakeResources(vcpus=1, memory=2048)
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         vercel_module._store_snapshot("task-123", "snap_saved")
@@ -1181,3 +1184,82 @@ class TestSnapshotExpirationConfig:
         with pytest.raises(ValueError, match="TERMINAL_VERCEL_SNAPSHOT_EXPIRATION"):
             _parse_env_var("TERMINAL_VERCEL_SNAPSHOT_EXPIRATION", "1d", parse_snapshot_expiration,
                            "a duration like 1d")
+
+
+class TestPersistentFlag:
+    """``persistent`` must be sent, not left to the platform default.
+
+    Vercel's default is ``persistent: True``, so a Hermes sandbox created for a profile with
+    ``container_persistent: false`` contradicted itself: every stop — and, more often, every hit of
+    the sandbox's ``execution_time_limit`` — left an automatic ~800 MB snapshot behind, and the
+    project's single snapshot quota filled up (live: the API reported ``persistent: True`` for every
+    Hermes sandbox while the profile said false).
+    """
+
+    def test_ephemeral_create_sends_persistent_false(self, make_env, vercel_sdk):
+        make_env(persistent_filesystem=False)
+
+        assert vercel_sdk.create_kwargs[-1]["persistent"] is False
+
+    def test_persistent_create_sends_persistent_true(self, make_env, vercel_sdk):
+        make_env(persistent_filesystem=True)
+
+        assert vercel_sdk.create_kwargs[-1]["persistent"] is True
+
+    def test_restore_keeps_the_flag(self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path):
+        from datetime import timedelta
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        vercel_module._store_snapshot("task-123", "snap_saved")
+
+        make_env(persistent_filesystem=True)
+
+        restore = vercel_sdk.create_kwargs[-1]
+        assert restore["source"].snapshot_id == "snap_saved"
+        assert restore["persistent"] is True
+        assert "image" not in restore
+        assert vercel_sdk.create_kwargs[-1]["execution_time_limit"] >= timedelta(minutes=5)
+
+
+class TestResourcePair:
+    """Vercel accepts ONE resource shape: ``memory == vcpus * 2048``.
+
+    Live: creating with Hermes's shared defaults (``container_cpu 1``, ``container_memory 5120``)
+    answers ``HTTP 400: `resources.memory` should equal `resources.vcpus` * 2048
+    (code=bad_request)``. Every existing vercel profile only worked because it overrode the pair in
+    ``.env``; a new profile on defaults could not start at all.
+    """
+
+    def test_default_pair_is_derived_to_the_legal_memory(self, make_env, vercel_sdk, caplog):
+        make_env(cpu=1, memory=5120)
+
+        assert vercel_sdk.create_kwargs[-1]["resources"] == _FakeResources(vcpus=1, memory=2048)
+        assert "not legal" in caplog.text and "2048" in caplog.text
+
+    def test_legal_pair_is_sent_untouched_and_unwarned(self, make_env, vercel_sdk, caplog):
+        make_env(cpu=4, memory=8192)
+
+        assert vercel_sdk.create_kwargs[-1]["resources"] == _FakeResources(vcpus=4, memory=8192)
+        assert "not legal" not in caplog.text
+
+    def test_fractional_cpu_floors_then_derives(self, make_env, vercel_sdk):
+        make_env(cpu=2.7, memory=8192)
+
+        assert vercel_sdk.create_kwargs[-1]["resources"] == _FakeResources(vcpus=2, memory=4096)
+
+    def test_memory_only_config_derives_the_vcpu_count(self, make_env, vercel_sdk):
+        make_env(cpu=0, memory=6144)
+
+        assert vercel_sdk.create_kwargs[-1]["resources"] == _FakeResources(vcpus=3, memory=6144)
+
+    def test_unsatisfiable_pair_sends_no_resources_rather_than_an_illegal_one(
+        self, make_env, vercel_sdk
+    ):
+        make_env(cpu=0, memory=5000)
+
+        assert vercel_sdk.create_kwargs[-1]["resources"] is None
+
+    def test_no_positive_resources_means_no_resources_argument(self, make_env, vercel_sdk):
+        make_env(cpu=0, memory=0)
+
+        assert vercel_sdk.create_kwargs[-1]["resources"] is None

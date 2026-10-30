@@ -133,8 +133,15 @@ class ClientLifecycleMixin:
                 if owner and owner != task_id:
                     clear_file_ops_cache(owner)
 
+        def release_cloud_sandbox() -> None:
+            # ``cleanup_vm`` addresses the env by task/session id, but a cloud sandbox is cached under
+            # its SESSION key, so a finished session used to leave Vercel compute running until the
+            # idle reaper noticed. session_ending: every turn id recorded for that key is dead now.
+            from tools.terminal_tool_lifecycle import release_run_env
+            release_run_env(task_id, session_ending=True)
+
         for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
-                     release_computer_use, forget_file_state):
+                     release_computer_use, forget_file_state, release_cloud_sandbox):
             _quietly(step)
 
     def _client_log_context(self) -> str:

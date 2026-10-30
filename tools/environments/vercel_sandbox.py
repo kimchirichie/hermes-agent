@@ -85,6 +85,8 @@ def _make_vercel_client():
 _WRITE_RETRY_ATTEMPTS = 3
 _RETRY_BACKOFF_STEP = timedelta(milliseconds=100)
 _MIN_SANDBOX_TIMEOUT = timedelta(minutes=5)
+# Vercel rejects any resource pair where memory != vcpus * 2048 (HTTP 400 bad_request).
+_VERCEL_MEMORY_PER_VCPU_MB = 2048
 _MIN_RUNNING_WAIT = timedelta(seconds=1)
 _RUNNING_WAIT_POLL_INTERVAL = timedelta(milliseconds=250)
 _STOP_TIMEOUT = timedelta(seconds=15)
@@ -228,10 +230,46 @@ def _is_terminal(status: Any) -> bool:
     return status in {S.ABORTED, S.FAILED, S.STOPPED}
 
 
+def _vercel_resources(cpu: float, memory: int) -> tuple[int | None, int | None]:
+    """(vcpus, memory_mb) in the ONLY shape Vercel accepts: memory == vcpus * 2048.
+
+    The shared Hermes defaults (``container_cpu: 1``, ``container_memory: 5120``) break that rule, and
+    Vercel answers such a create with HTTP 400 ``resources.memory`` should equal ``resources.vcpus`` *
+    2048 — so a profile with no explicit override could not start a sandbox at all (every existing
+    vercel profile only worked because it overrode the pair). Keep the requested vCPU count and derive
+    the memory Vercel insists on, naming the number in a warning: a silent substitution would look like
+    a config that took effect.
+    """
+    vcpus = math.floor(cpu) if cpu and cpu > 0 else None
+    memory_mb = int(memory) if memory and memory > 0 else None
+    if vcpus is None and memory_mb is not None:
+        # No vCPU count to derive from: honour the memory if it divides cleanly into vCPUs.
+        if memory_mb % _VERCEL_MEMORY_PER_VCPU_MB == 0:
+            vcpus = memory_mb // _VERCEL_MEMORY_PER_VCPU_MB
+        else:
+            return None, None
+    if vcpus is None:
+        return None, None
+    legal_mb = vcpus * _VERCEL_MEMORY_PER_VCPU_MB
+    if memory_mb != legal_mb:
+        logger.warning(
+            "Vercel: container_memory %s MB is not legal for %s vCPU(s) — Vercel requires "
+            "memory = vcpus * %s MB. Using %s MB; set terminal.container_memory: %s to make it explicit.",
+            memory_mb, vcpus, _VERCEL_MEMORY_PER_VCPU_MB, legal_mb, legal_mb)
+        memory_mb = legal_mb
+    return vcpus, memory_mb
+
+
 class VercelSandboxEnvironment(BaseEnvironment):
     """Vercel cloud sandbox backend."""
 
     _stdin_mode = "payload"
+    # A finished one-shot run must not leave its sandbox running: the env is cached under the SESSION
+    # key, so per-turn cleanup_vm(task_id) never found it and the box stayed up (billable) until the
+    # idle reaper or the platform's execution_time_limit got it. Read by
+    # tools.terminal_tool_lifecycle.release_run_env(); only ever honoured for a NON-persistent env,
+    # because a persistent filesystem IS the task's state and is restored from its snapshot.
+    _release_when_run_finishes = True
 
     def __init__(self, runtime: str | None = None, cwd: str = DEFAULT_VERCEL_CWD, timeout: int = 60,
                  cpu: float = 1, memory: int = 5120, disk: int = _DEFAULT_CONTAINER_DISK_MB,
@@ -261,7 +299,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
         self._sync_manager: FileSyncManager | None = None
         _ensure_vercel_sdk()
         from vercel.sandbox.sync import SandboxResources
-        vcpus, memory_mb = (math.floor(cpu) if cpu > 0 else None), (memory if memory > 0 else None)
+        vcpus, memory_mb = _vercel_resources(cpu, memory)
         # Vercel deprecated runtimes (Aug 2026) and the 0.12 SDK no longer accepts one:
         # a pinned runtime is logged and dropped, and the image is always sent instead.
         if runtime:
@@ -271,7 +309,14 @@ class VercelSandboxEnvironment(BaseEnvironment):
         self._create_kwargs = {
             "execution_time_limit": max(timedelta(seconds=max(self.timeout, 0)), timedelta(minutes=5)),
             "image": image or DEFAULT_VERCEL_IMAGE,
-            "resources": SandboxResources(vcpus=vcpus, memory=memory_mb) if (vcpus, memory_mb) != (None, None) else None}
+            # Sent explicitly: the platform default is persistent=True, so a Hermes ephemeral sandbox
+            # used to contradict container_persistent: false — every stop (and every hit of the
+            # execution_time_limit) then left an automatic ~800 MB snapshot behind, and the project's
+            # single snapshot quota filled up. persistent=False means "dies with its session", which
+            # is exactly what an ephemeral Hermes filesystem wants; a persistent one is sent as
+            # persistent=True so its snapshot survives to be restored.
+            "persistent": self._persistent,
+            "resources": SandboxResources(vcpus=vcpus, memory=memory_mb) if vcpus is not None else None}
         if self._snapshot_expiration is not None:
             self._create_kwargs["snapshot_expiration"] = self._snapshot_expiration
         self._attach_fresh_sandbox(cwd)

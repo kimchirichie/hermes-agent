@@ -188,6 +188,16 @@ _env_lock = threading.Lock()
 _creation_locks: dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _calls_in_flight: dict[str, int] = {}  # Foreground calls running per env key; the reaper skips these
+# Which run used / created the env cached under each RESOLVED key. The cache is keyed by
+# ``session:<key>``/``default``/``profile:<name>``, never by the turn's own task id, so the
+# end-of-run release needs this to tell "my env, nobody else's" from "the session's shared env"
+# (tools.terminal_tool_lifecycle.release_run_env).
+_env_users: dict[str, set[str]] = {}
+_env_created_by: dict[str, str] = {}
+# Whether the run that CREATED the env was a one-off (finite) turn. Recorded at creation time, when
+# the turn's context is certainly available, so the end-of-run release does not depend on the turn
+# finalizer still seeing that context (tools.terminal_tool_lifecycle.release_run_env).
+_env_one_shot: dict[str, bool] = {}
 _cleanup_thread = None
 _cleanup_running = False
 
@@ -648,6 +658,40 @@ def _select_image(env_type: str, overrides: dict[str, Any], config: dict[str, An
     return overrides.get(key) or config[key]
 
 
+def _run_is_one_shot_turn() -> bool:
+    """True for an explicitly finite (one-off) turn: a gateway-served ``-z`` / ``-q`` run.
+
+    Conservative by design — only an explicit ``True`` counts. ``None`` is a legacy standalone CLI
+    turn or a kanban goal_mode follow-up (the same process keeps working in this session, so its
+    sandbox must survive to the next turn) and ``False`` is a live conversation.
+
+    Lives here (not in ``terminal_tool_lifecycle``) because the env-creation path records the answer
+    per env: a turn finalizer can run without the admission's context, and the recorded value is
+    what the end-of-run release trusts.
+    """
+    try:
+        from gateway.session_finite import finite_turn_required
+    except Exception:  # gateway module absent (standalone checkout): never a one-shot turn
+        return False
+    return finite_turn_required() is True
+
+
+def _note_env_user(key: str, task_id: Optional[str], *, created: bool = False) -> None:
+    """Record that *task_id* is using (or created) the env cached under *key*.
+
+    Caller holds ``_env_lock``. The cache key is the RESOLVED one (``session:<key>``,
+    ``default``, ``profile:<name>``, ...), so without this the end-of-run release could not
+    tell its own sandbox from one a parent turn, a delegate child or a later turn still uses.
+    """
+    user = str(task_id or "").strip()
+    if not user:
+        return
+    _env_users.setdefault(key, set()).add(user)
+    if created:
+        _env_created_by[key] = user
+        _env_one_shot[key] = _run_is_one_shot_turn()
+
+
 def _lookup_active_env(effective_task_id: str, task_id: Optional[str]):
     """Return the cached env for the collapsed id, else for the raw task_id, else None.
 
@@ -659,6 +703,7 @@ def _lookup_active_env(effective_task_id: str, task_id: Optional[str]):
     for key in (effective_task_id, task_id):
         if key and key in _active_environments:
             _last_activity[key] = time.time()
+            _note_env_user(key, task_id or effective_task_id)
             return _active_environments[key]
     return None
 
@@ -1333,6 +1378,7 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
         with _env_lock:
             _active_environments[eff] = new_env
             _last_activity[eff] = time.time()
+            _note_env_user(eff, task_id or eff, created=True)
         logger.info("%s environment ready for task %s", env_type, eff[:8])
         return new_env
 
