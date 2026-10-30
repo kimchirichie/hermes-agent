@@ -26,6 +26,7 @@ from hermes_constants import get_hermes_home
 from tools.environments.base import BaseEnvironment, _load_json_store, _update_json_store
 from tools.environments.base_output import _ThreadedProcessHandle
 from tools.environments.file_sync import FileSyncManager, iter_sync_files, quoted_rm_command
+from tools.terminal_tool_config import parse_snapshot_expiration
 
 logger = logging.getLogger(__name__)
 
@@ -236,13 +237,21 @@ class VercelSandboxEnvironment(BaseEnvironment):
                  cpu: float = 1, memory: int = 5120, disk: int = _DEFAULT_CONTAINER_DISK_MB,
                  persistent_filesystem: bool = True, task_id: str = "default",
                  image: str | None = None, setup_script: str | None = None,
-                 setup_timeout: int = DEFAULT_VERCEL_SETUP_TIMEOUT):
+                 setup_timeout: int = DEFAULT_VERCEL_SETUP_TIMEOUT,
+                 snapshot_expiration: str | float | timedelta | None = None):
         super().__init__(cwd=cwd, timeout=timeout)
         if disk not in {0, _DEFAULT_CONTAINER_DISK_MB}:
             raise ValueError(
                 "Vercel Sandbox does not support configurable container_disk. "
                 "Use the default shared setting.")
         self._persistent, self._task_id, self._requested_cwd = persistent_filesystem, task_id, cwd
+        # Vercel keeps a snapshot of a stopped sandbox for 30 days unless creation asks for less,
+        # and a project has one shared snapshot quota: abandoned ephemeral sandboxes filled it
+        # (HTTP 402) on 2026-10-29. A persistent task must still find its own snapshot later, so
+        # its lifetime stays the platform default; an ephemeral sandbox gets the configured one.
+        # Parsed before any SDK call so a bad value cannot leave a half-built sandbox behind.
+        self._snapshot_expiration = (None if self._persistent
+                                     else parse_snapshot_expiration(snapshot_expiration))
         self._setup_script = (setup_script or "").strip() or None
         self._setup_timeout = setup_timeout
         self._lock = threading.Lock()
@@ -263,6 +272,8 @@ class VercelSandboxEnvironment(BaseEnvironment):
             "execution_time_limit": max(timedelta(seconds=max(self.timeout, 0)), timedelta(minutes=5)),
             "image": image or DEFAULT_VERCEL_IMAGE,
             "resources": SandboxResources(vcpus=vcpus, memory=memory_mb) if (vcpus, memory_mb) != (None, None) else None}
+        if self._snapshot_expiration is not None:
+            self._create_kwargs["snapshot_expiration"] = self._snapshot_expiration
         self._attach_fresh_sandbox(cwd)
         self.init_session()
 

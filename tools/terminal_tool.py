@@ -47,8 +47,8 @@ from tools.terminal_tool_lifecycle import (
 from tools.terminal_tool_config import (
     _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
     _is_windows_drive_path, _parse_env_var, _plugin_env_flag, _quiet, _safe_getcwd, _tenv, _tenv_bool,
-    _in_sandbox_home, coerce_ssh_remote_cwd, home_profile_name, profile_container_key,
-    translate_mounted_host_path,
+    _in_sandbox_home, coerce_ssh_remote_cwd, home_profile_name, parse_snapshot_expiration,
+    profile_container_key, translate_mounted_host_path,
 )
 from tools.terminal_tool_backends import (
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
@@ -850,6 +850,11 @@ def _get_env_config() -> dict[str, Any]:
         "vercel_image": _tenv("TERMINAL_VERCEL_IMAGE", "").strip(),
         "vercel_setup_script": _tenv("TERMINAL_VERCEL_SETUP_SCRIPT", "").strip(),
         "vercel_setup_timeout": _parse_env_var("TERMINAL_VERCEL_SETUP_TIMEOUT", "300"),
+        # Parsed here, not in the backend, so a bad duration fails with the config value that
+        # caused it instead of surfacing at sandbox creation.
+        "vercel_snapshot_expiration": _parse_env_var(
+            "TERMINAL_VERCEL_SNAPSHOT_EXPIRATION", "1d", parse_snapshot_expiration,
+            "a duration like 1d, 36h or 2w, or 0 to never expire"),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,

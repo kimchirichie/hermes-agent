@@ -350,6 +350,13 @@ DEFAULT_CONFIG = {
         # "" disables it. Credentials arrive as terminal.credential_files, never as arguments.
         "vercel_setup_script": "",
         "vercel_setup_timeout": 300,  # seconds; the setup script is killed and the task fails loudly
+        # vercel_sandbox backend only: lifetime of the snapshot Vercel keeps when a sandbox stops,
+        # as a <number><unit> duration (s m h d w y). Vercel allows 0 (never expire) or 1 day to
+        # 10 years, and its default is 30 days. Stopped ephemeral sandboxes crowded the project
+        # snapshot quota into an HTTP 402, so the default is the shortest value Vercel accepts.
+        # A persistent filesystem keeps the platform default, since the task restores its own
+        # snapshot later. "" leaves Vercel's default in place for ephemeral sandboxes too.
+        "vercel_snapshot_expiration": "1d",
         # Container limits (docker, modal, daytona, vercel_sandbox, container plugin backends; not local/ssh).
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)

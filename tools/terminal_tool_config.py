@@ -12,6 +12,7 @@ import os
 import posixpath
 import re
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any, overload
 
 # Log-record parity with the origin module.
@@ -75,6 +76,52 @@ def home_profile_name() -> str:
 def profile_container_key(profile: str) -> str:
     """Persistent-Docker container key of a profile: the default profile stays literally ``"default"``."""
     return "default" if profile == "default" else f"profile:{profile}"
+
+
+# Vercel accepts a snapshot lifetime of 0 (never expire) or 1 day to 10 years; anything in
+# between is rejected by the API, so it is rejected here instead — at config load, not when a
+# sandbox is created.
+SNAPSHOT_EXPIRATION_MIN = timedelta(days=1)
+SNAPSHOT_EXPIRATION_MAX = timedelta(days=3650)  # ten years
+_SNAPSHOT_EXPIRATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
+_SNAPSHOT_EXPIRATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhdwy])$", re.IGNORECASE)
+
+
+def parse_snapshot_expiration(value: str | float | timedelta | None) -> timedelta | None:
+    """Snapshot lifetime from a ``terminal.vercel_snapshot_expiration`` value.
+
+    Accepts a ``timedelta``, a number of seconds, or a ``<number><unit>`` string (s m h d w y).
+    ``None``/``""`` means "let Vercel decide" (30 days). Zero means never expire, the Sandbox
+    API's own convention. A nonzero value outside 1 day .. 10 years raises ValueError: the API
+    would reject it anyway, and failing here keeps the error at config load with a fix hint.
+    """
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        delta = value
+    elif isinstance(value, bool):
+        raise ValueError(f"snapshot expiration must be a duration, got {value!r}")
+    elif isinstance(value, (int, float)):
+        delta = timedelta(seconds=value)
+    elif isinstance(value, str):
+        raw = value.strip().lower()
+        if not raw:
+            return None
+        match = _SNAPSHOT_EXPIRATION_RE.match(raw)
+        if not match:
+            if re.fullmatch(r"0+(?:\.0+)?", raw):
+                return timedelta(0)  # bare "0": never expire, the API's own zero case
+            raise ValueError(
+                f"snapshot expiration {value!r} is not a duration; use a number and a unit, "
+                "e.g. 1d, 36h, 2w (s, m, h, d, w, y)")
+        delta = timedelta(seconds=float(match.group(1)) * _SNAPSHOT_EXPIRATION_UNITS[match.group(2)])
+    else:
+        raise ValueError(f"snapshot expiration must be a duration string, got {type(value).__name__}")
+    if delta and not SNAPSHOT_EXPIRATION_MIN <= delta <= SNAPSHOT_EXPIRATION_MAX:
+        raise ValueError(
+            f"snapshot expiration {value!r} is out of range: use 0 (never expire) or between "
+            "1 day and 10 years (the Vercel Sandbox API's own limits)")
+    return delta
 
 
 def _safe_getcwd() -> str:

@@ -75,6 +75,27 @@ def _validate_web_backends(config: dict[str, Any], issues: list[ConfigIssue]) ->
                    "Run 'hermes tools' and pick a different Web Search & Extract provider")
 
 
+def _validate_vercel_snapshot_expiration(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
+    """``terminal.vercel_snapshot_expiration`` must be a duration Vercel would accept.
+
+    A bad value would otherwise fail when a sandbox is created (or, worse, past that point on
+    the platform side), and the Vercel backend's range is not obvious: 0 (never expire) or
+    1 day to 10 years, so the tempting "1h" is invalid.
+    """
+    terminal_cfg = config.get("terminal")
+    if not isinstance(terminal_cfg, dict) or "vercel_snapshot_expiration" not in terminal_cfg:
+        return
+    raw = terminal_cfg.get("vercel_snapshot_expiration")
+    try:
+        from tools.terminal_tool_config import parse_snapshot_expiration
+        parse_snapshot_expiration(raw)
+    except Exception as exc:
+        _issue(issues, "error",
+               f"terminal.vercel_snapshot_expiration is invalid: {exc}",
+               "Use a <number><unit> duration: 0 (never expire) or 1 day to 10 years, "
+               "e.g. 1d, 36h, 2w. Leave it empty to keep Vercel's 30-day default.")
+
+
 def _container_slots() -> dict[str, str]:
     """Dotted key -> ``"list"``/``"mapping"`` for every slot the schema fixes to a container:
     ``DEFAULT_CONFIG`` (sections included) plus the known-container table for roots it omits."""

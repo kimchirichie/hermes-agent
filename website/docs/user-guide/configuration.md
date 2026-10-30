@@ -596,6 +596,7 @@ terminal:
   cwd: /vercel/sandbox            # default workspace root
   container_persistent: true      # Snapshot/restore filesystem
   container_disk: 51200           # Shared default only; custom disk is unsupported
+  vercel_snapshot_expiration: 1d   # Lifetime of a stopped sandbox's snapshot (ephemeral only)
 ```
 
 **Required install:** Install the optional SDK extra:
@@ -623,6 +624,8 @@ OIDC tokens are short-lived and should not be used as the documented deployment 
 **Image:** `terminal.vercel_image` picks the container image for fresh sandboxes: a [Vercel managed image](https://vercel.com/docs/sandbox/concepts/images) such as `vercel/sandbox/universal:latest` (the default: Ubuntu, Node.js 24, Python 3.14), `vercel/sandbox/node:26` or `vercel/sandbox/python:3.14`, or a repository from your project's Vercel Container Registry (a bare name resolves to `latest`; a tag or digest pins it). The older `terminal.vercel_runtime` presets (`node24`, `node22`, `python3.13`) are [deprecated by Vercel](https://vercel.com/docs/sandbox/concepts/runtimes); a pinned runtime still works and overrides the image, but the two cannot be combined. Snapshot restores carry their own filesystem and send neither.
 
 **Persistence:** When `container_persistent: true`, Hermes snapshots the sandbox filesystem during cleanup and restores a later sandbox for the same task from that snapshot. Snapshot contents can include Hermes-synced credentials, skills, and cache files that were copied into the sandbox. This preserves filesystem state only; it does not preserve live sandbox identity, PID space, shell state, or running background processes.
+
+**Snapshot lifetime:** Vercel snapshots a sandbox when it stops and keeps that snapshot for 30 days unless the sandbox was created with a shorter lifetime. Snapshots count against one project-wide storage quota, so a stream of short-lived sandboxes can exhaust it: the project then answers `HTTP 402 Pro trial: Snapshots Storage limit exceeded` and no sandbox can start. `terminal.vercel_snapshot_expiration` sets the lifetime for sandboxes with `container_persistent: false` (default `1d`; `0` means never expire). Vercel accepts only `0` or 1 day to 10 years, so a shorter value such as `1h` is rejected at config load. A persistent filesystem keeps the platform default, because the task restored later still needs its own snapshot.
 
 **Background commands:** `terminal(background=true)` uses Hermes' generic non-local background process flow. You can spawn, poll, wait, view logs, and kill processes through the normal process tool while the sandbox is alive. Hermes does not provide native Vercel detached-process recovery after cleanup or restart.
 

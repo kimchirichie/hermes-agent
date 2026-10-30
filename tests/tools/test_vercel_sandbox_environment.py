@@ -1081,3 +1081,103 @@ class TestVercelProfileScopedCredentials:
         assert env._vercel_client() is client and vercel_sdk.get_sandbox_calls
         env.cleanup()
         assert client.closed is True
+
+
+class TestSnapshotExpiration:
+    """``terminal.vercel_snapshot_expiration``: Vercel snapshots a stopping sandbox and keeps it
+    for 30 days unless creation asked for less. One project-wide snapshot quota, so abandoned
+    ephemeral sandboxes exhausted it (HTTP 402 on 2026-10-29). An ephemeral sandbox gets the
+    configured lifetime; a persistent one keeps the platform default so its own restore works."""
+
+    def test_ephemeral_create_sends_the_configured_expiration(self, make_env, vercel_sdk):
+        from datetime import timedelta
+
+        make_env(persistent_filesystem=False, snapshot_expiration="1d")
+
+        assert vercel_sdk.create_kwargs[-1]["snapshot_expiration"] == timedelta(days=1)
+
+    def test_configured_duration_units_and_float_seconds(self, make_env, vercel_sdk):
+        from datetime import timedelta
+
+        make_env(persistent_filesystem=False, snapshot_expiration="36h")
+        make_env(persistent_filesystem=False, snapshot_expiration="2w")
+        make_env(persistent_filesystem=False, snapshot_expiration=86400)
+
+        assert vercel_sdk.create_kwargs[-3]["snapshot_expiration"] == timedelta(hours=36)
+        assert vercel_sdk.create_kwargs[-2]["snapshot_expiration"] == timedelta(days=14)
+        assert vercel_sdk.create_kwargs[-1]["snapshot_expiration"] == timedelta(days=1)
+
+    def test_zero_means_never_expire(self, make_env, vercel_sdk):
+        from datetime import timedelta
+
+        make_env(persistent_filesystem=False, snapshot_expiration="0")
+
+        assert vercel_sdk.create_kwargs[-1]["snapshot_expiration"] == timedelta(0)
+
+    def test_persistent_create_keeps_todays_behaviour(self, make_env, vercel_sdk):
+        """A persistent task restores its own snapshot later, so nothing about its lifetime
+        changes: the kwargs carry no expiration at all."""
+        make_env(persistent_filesystem=True, snapshot_expiration="1d")
+
+        assert "snapshot_expiration" not in vercel_sdk.create_kwargs[-1]
+
+    def test_unset_expiration_leaves_the_platform_default(self, make_env, vercel_sdk):
+        make_env(persistent_filesystem=False, snapshot_expiration="")
+        make_env(persistent_filesystem=False, snapshot_expiration=None)
+
+        assert "snapshot_expiration" not in vercel_sdk.create_kwargs[-2]
+        assert "snapshot_expiration" not in vercel_sdk.create_kwargs[-1]
+
+    @pytest.mark.parametrize("bad", ["1h", "30m", "-1d", "1d4", "day", "12", "1y2w", "3651d"])
+    def test_bad_duration_raises_before_any_sandbox_call(self, make_env, vercel_sdk, bad):
+        """A value Vercel would reject fails here, with no sandbox created and nothing to clean up."""
+        with pytest.raises(ValueError, match="snapshot expiration"):
+            make_env(persistent_filesystem=False, snapshot_expiration=bad)
+
+        assert vercel_sdk.create_kwargs == []
+
+
+class TestSnapshotExpirationConfig:
+    """Config parsing: the value is a duration string, and a bad one fails at load, not later."""
+
+    @pytest.mark.parametrize("raw,expected_days", [("1d", 1), ("36h", 1.5), ("2w", 14), ("1y", 365)])
+    def test_durations_parse_to_timedeltas(self, vercel_module, raw, expected_days):
+        from datetime import timedelta
+
+        from tools.terminal_tool_config import parse_snapshot_expiration
+
+        assert parse_snapshot_expiration(raw) == timedelta(days=expected_days)
+
+    def test_empty_and_none_mean_platform_default(self):
+        from tools.terminal_tool_config import parse_snapshot_expiration
+
+        assert parse_snapshot_expiration("") is None
+        assert parse_snapshot_expiration(None) is None
+
+    def test_bad_value_is_a_config_error_at_startup(self):
+        """``hermes`` prints validate_config_structure issues on startup, so a typo is visible
+        there instead of surfacing when the first sandbox is created."""
+        from hermes_cli.config import validate_config_structure
+
+        issues = validate_config_structure({"terminal": {"vercel_snapshot_expiration": "1h"}})
+
+        errors = [i for i in issues if i.severity == "error"]
+        assert any("vercel_snapshot_expiration" in i.message for i in errors)
+
+    def test_valid_value_is_not_flagged(self):
+        from hermes_cli.config import validate_config_structure
+
+        issues = validate_config_structure({"terminal": {"vercel_snapshot_expiration": "1d"}})
+
+        assert not [i for i in issues if "vercel_snapshot_expiration" in i.message]
+
+    def test_env_builder_rejects_a_bad_value_with_its_name(self, monkeypatch):
+        from tools.terminal_tool_config import parse_snapshot_expiration
+        from tools.terminal_tool_config import _parse_env_var
+
+        raw = {"TERMINAL_VERCEL_SNAPSHOT_EXPIRATION": "1h"}
+        monkeypatch.setattr("tools.terminal_tool_config._tenv", lambda name, default="": raw.get(name, default))
+
+        with pytest.raises(ValueError, match="TERMINAL_VERCEL_SNAPSHOT_EXPIRATION"):
+            _parse_env_var("TERMINAL_VERCEL_SNAPSHOT_EXPIRATION", "1d", parse_snapshot_expiration,
+                           "a duration like 1d")
