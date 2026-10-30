@@ -40,6 +40,17 @@ class _FakeSnapshot:
     id: str
 
 
+@dataclass(frozen=True)
+class _FakeSnapshotHandle:
+    """Mirror of ``SyncSnapshot``: 0.10 deletes a snapshot through its handle."""
+    sdk: object
+    id: str
+
+    def delete(self):
+        self.sdk.deleted_snapshots.append(self.id)
+        return self
+
+
 class _FakeBatch:
     """Mirror of ``SyncSandboxFilesystem.batch()``: stages writes, uploads them on exit."""
 
@@ -123,6 +134,9 @@ class _FakeSandbox:
         self.snapshot_calls: list[tuple[tuple, dict]] = []
         self.snapshot_side_effects: list[object] = []
         self.snapshot_id = "snap_default"
+        # What the platform reports after a stop: a persistent sandbox's automatic snapshot.
+        self.snapshot_id_on_stop: str | None = None
+        self.current_snapshot_id: str | None = None
 
     def run_process(self, cmd: str, args: list[str] | None = None, **kwargs):
         args = list(args or [])
@@ -142,6 +156,10 @@ class _FakeSandbox:
 
     def stop(self, *args, **kwargs) -> None:
         self.stop_calls.append((args, kwargs))
+        # The API takes the automatic snapshot AS PART OF the stop, and reports its id on the
+        # sandbox afterwards — the id does not exist before the stop.
+        if self.snapshot_id_on_stop is not None:
+            self.current_snapshot_id = self.snapshot_id_on_stop
 
     def snapshot(self, *args, **kwargs):
         self.snapshot_calls.append((args, kwargs))
@@ -176,6 +194,9 @@ class _FakeSDK:
         self.sandboxes: list[_FakeSandbox] = []
         self.get_sandbox_calls: list[str] = []
         self.get_sandbox_side_effects: list[object] = []
+        self.get_snapshot_calls: list[str] = []
+        self.deleted_snapshots: list[str] = []
+        self.delete_snapshot_side_effects: list[object] = []
 
     @property
     def current(self) -> _FakeSandbox:
@@ -204,6 +225,15 @@ class _FakeSDK:
             if isinstance(effect, _FakeSandbox):
                 return effect
         return self.sandboxes[-1]
+
+    def get_snapshot(self, *, snapshot_id: str):
+        """Stand-in for ``SyncSandboxClient.get_snapshot``: deletion goes through the handle."""
+        self.get_snapshot_calls.append(snapshot_id)
+        if self.delete_snapshot_side_effects:
+            effect = self.delete_snapshot_side_effects.pop(0)
+            if isinstance(effect, Exception):
+                raise effect
+        return _FakeSnapshotHandle(self, snapshot_id)
 
 
 def _cwd_result(body: str = "", *, cwd: str = "/vercel/sandbox", returncode: int = 0):
@@ -261,6 +291,10 @@ class _FakeClient:
     def get_sandbox(self, *, name):
         self.resolved_credentials()
         return self._sdk.get_sandbox(name=name)
+
+    def get_snapshot(self, *, snapshot_id):
+        self.resolved_credentials()
+        return self._sdk.get_snapshot(snapshot_id=snapshot_id)
 
     def close(self):
         self.closed = True
@@ -455,7 +489,7 @@ class TestFileSync:
         )
         env = make_env()
         sandbox = vercel_sdk.current
-        sandbox.snapshot_id = "snap_cleanup"
+        sandbox.snapshot_id_on_stop = "snap_cleanup"
         vercel_sdk.current.read_bytes_content = _tar_bytes(
             {
                 "home/vercel/.hermes/credentials/token.txt": b"remote-token",
@@ -480,11 +514,12 @@ class TestFileSync:
         assert src.read_text() == "host-token"
         assert not (tmp_path / "new.txt").exists()
         assert not (tmp_path / "skip.txt").exists()
-        assert len(sandbox.snapshot_calls) == 1
-        assert len(sandbox.stop_calls) == 1  # always stop after snapshot to avoid resource leaks
+        # One snapshot per teardown, and the PLATFORM takes it: no explicit snapshot() call.
+        assert sandbox.snapshot_calls == []
+        assert len(sandbox.stop_calls) == 1
         assert vercel_module._load_snapshots() == {"task-123": "snap_cleanup"}
 
-    def test_cleanup_sync_back_failure_from_download_does_not_block_snapshot(
+    def test_cleanup_sync_back_failure_from_download_does_not_block_stop(
         self, make_env, vercel_sdk, monkeypatch, tmp_path
     ):
         src = tmp_path / "token.txt"
@@ -523,7 +558,8 @@ class TestFileSync:
         env.cleanup()
 
         assert src.read_text() == "host-token"
-        assert len(sandbox.snapshot_calls) == 1
+        assert sandbox.snapshot_calls == []
+        assert len(sandbox.stop_calls) == 1
         assert len(sandbox.read_bytes_calls) == 0
 
 
@@ -645,20 +681,74 @@ class TestSnapshotPersistence:
         assert "source" not in vercel_sdk.create_kwargs[1]
         assert vercel_module._load_snapshots() == {}
 
-    def test_cleanup_stops_when_snapshot_fails_without_storing_metadata(
+    def test_cleanup_without_a_stop_snapshot_id_stores_nothing(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        """A stop that yields no snapshot id (platform refused, or it reported none) must not
+        invent one: the task is left with no restore point rather than a broken pointer."""
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        env = make_env()
+        sandbox = vercel_sdk.current  # snapshot_id_on_stop stays None
+
+        env.cleanup()
+
+        assert sandbox.snapshot_calls == []
+        assert len(sandbox.stop_calls) == 1
+        assert vercel_module._load_snapshots() == {}
+
+    def test_cleanup_reads_the_snapshot_id_back_from_the_stopped_sandbox(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        """The handle's own ``current_snapshot_id`` can still name the snapshot a RESTORED sandbox
+        was created from, so the id is read from the live sandbox after the stop — never from the
+        handle. Keying the task to the stale id would resurrect a snapshot this teardown deletes."""
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        vercel_module._store_snapshot("task-123", "snap_source")
+        env = make_env()                     # restores from snap_source
+        vercel_sdk.current.current_snapshot_id = "snap_source"  # what a restored box reports
+        stopped = _FakeSandbox()
+        stopped.current_snapshot_id = "snap_after_stop"
+        vercel_sdk.get_sandbox_side_effects.append(stopped)
+
+        env.cleanup()
+
+        assert vercel_sdk.get_sandbox_calls == ["sb-123"]
+        assert vercel_module._load_snapshots() == {"task-123": "snap_after_stop"}
+        # and the stale source snapshot is swept, exactly once
+        assert vercel_sdk.deleted_snapshots == ["snap_source"]
+
+    def test_cleanup_survives_a_failed_read_back_and_keeps_the_previous_id(
         self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
     ):
         hermes_home = tmp_path / ".hermes"
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        vercel_module._store_snapshot("task-123", "snap_previous")
         env = make_env()
-        sandbox = vercel_sdk.current
-        sandbox.snapshot_side_effects.append(RuntimeError("snapshot failed"))
+        vercel_sdk.get_sandbox_side_effects.append(RuntimeError("read failed"))
 
         env.cleanup()
 
-        assert len(sandbox.snapshot_calls) == 1
-        assert len(sandbox.stop_calls) == 1
-        assert vercel_module._load_snapshots() == {}
+        assert vercel_module._load_snapshots() == {"task-123": "snap_previous"}
+
+    def test_adopted_stop_snapshot_is_what_the_next_sandbox_restores(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        """End to end: teardown adopts the platform's snapshot, and the task's next sandbox is
+        created from that same id — the restore path never learned about a second snapshot."""
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        env = make_env()
+        vercel_sdk.current.snapshot_id_on_stop = "snap_adopted"
+        env.cleanup()
+        assert vercel_module._load_snapshots()["task-123"] == "snap_adopted"
+
+        reused = _FakeSandbox(cwd="/restored")
+        vercel_sdk.create_side_effects.append(reused)
+        make_env()
+
+        assert vercel_sdk.create_kwargs[-1]["source"].snapshot_id == "snap_adopted"
 
     def test_non_persistent_cleanup_stops_without_snapshot(
         self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
@@ -667,11 +757,13 @@ class TestSnapshotPersistence:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         env = make_env(persistent_filesystem=False)
         sandbox = vercel_sdk.current
+        sandbox.snapshot_id_on_stop = "snap_should_be_ignored"
 
         env.cleanup()
 
         assert sandbox.snapshot_calls == []
         assert len(sandbox.stop_calls) == 1
+        # persistent=False produces no automatic snapshot, and Hermes must not adopt one anyway.
         assert vercel_module._load_snapshots() == {}
 
     def test_persistent_cleanup_without_task_id_stops_without_snapshot(
@@ -681,6 +773,7 @@ class TestSnapshotPersistence:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         env = make_env(task_id="")
         sandbox = vercel_sdk.current
+        sandbox.snapshot_id_on_stop = "snap_unkeyed"
 
         env.cleanup()
 
@@ -702,7 +795,7 @@ class TestCleanup:
 
         env.cleanup()
 
-        assert len(sandbox.snapshot_calls) == 1
+        assert sandbox.snapshot_calls == []
         assert len(sandbox.stop_calls) == 1
 
 
@@ -914,6 +1007,34 @@ class TestSetupScriptConfigBridge:
         assert config["vercel_setup_timeout"] == 900
         assert os.environ["TERMINAL_VERCEL_SETUP_SCRIPT"] == "scripts/clone.sh"
         assert os.environ["TERMINAL_VERCEL_SETUP_TIMEOUT"] == "900"
+
+    def test_execution_time_limit_reaches_the_env_config(self, monkeypatch):
+        """``terminal.vercel_execution_time_limit`` is the sandbox lifetime the backend reads —
+        it must survive the config.yaml -> env -> _get_env_config() bridge as a timedelta."""
+        from datetime import timedelta
+
+        from hermes_constants import get_hermes_home
+        from tools import terminal_tool
+
+        home = get_hermes_home()
+        home.mkdir(parents=True, exist_ok=True)
+        config_path = home / "config.yaml"
+        config_path.write_text(
+            "terminal:\n"
+            "  backend: vercel_sandbox\n"
+            "  vercel_execution_time_limit: 2h\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+        for name in ("TERMINAL_ENV", "TERMINAL_CWD", "TERMINAL_VERCEL_EXECUTION_TIME_LIMIT"):
+            monkeypatch.delenv(name, raising=False)
+        try:
+            config = terminal_tool._get_env_config()
+        finally:
+            config_path.unlink(missing_ok=True)
+
+        assert config["vercel_execution_time_limit"] == timedelta(hours=2)
+        assert os.environ["TERMINAL_VERCEL_EXECUTION_TIME_LIMIT"] == "2h"
 
 
 class TestToolDefaultCwd:
@@ -1184,6 +1305,195 @@ class TestSnapshotExpirationConfig:
         with pytest.raises(ValueError, match="TERMINAL_VERCEL_SNAPSHOT_EXPIRATION"):
             _parse_env_var("TERMINAL_VERCEL_SNAPSHOT_EXPIRATION", "1d", parse_snapshot_expiration,
                            "a duration like 1d")
+
+
+class TestExecutionTimeLimit:
+    """``terminal.vercel_execution_time_limit``: the sandbox's OWN lifetime.
+
+    Vercel enforces it as a hard cap — the box is stopped at the limit even with a process running
+    in it (live: a sandbox created with a 60 s limit and ``sleep 200`` inside was already
+    ``stopped`` at t+100 s), and ``_ensure_sandbox_ready()`` then silently creates a fresh one,
+    losing everything outside ``$HOME/.hermes``. The platform default is 5 minutes, which cut off
+    real turns, so Hermes sends its own value.
+    """
+
+    def test_configured_limit_is_sent_verbatim(self, make_env, vercel_sdk):
+        from datetime import timedelta
+
+        make_env(execution_time_limit="45m")
+
+        assert vercel_sdk.create_kwargs[-1]["execution_time_limit"] == timedelta(minutes=45)
+
+    def test_a_longer_turn_survives_the_old_five_minute_floor(self, make_env, vercel_sdk):
+        from datetime import timedelta
+
+        make_env(execution_time_limit="2h")
+
+        assert vercel_sdk.create_kwargs[-1]["execution_time_limit"] == timedelta(hours=2)
+
+    def test_the_limit_is_not_folded_into_the_command_timeout(self, make_env, vercel_sdk):
+        """``terminal.timeout`` is one command's budget; mixing it into the sandbox lifetime was
+        how a 180 s default became a 5-minute box. A short command timeout must not shorten the
+        configured limit, and a long one must not lengthen it."""
+        from datetime import timedelta
+
+        make_env(timeout=30, execution_time_limit="45m")
+        make_env(timeout=3600, execution_time_limit="45m")
+
+        assert vercel_sdk.create_kwargs[-2]["execution_time_limit"] == timedelta(minutes=45)
+        assert vercel_sdk.create_kwargs[-1]["execution_time_limit"] == timedelta(minutes=45)
+
+    def test_no_configured_limit_keeps_the_old_floor(self, make_env, vercel_sdk):
+        """A caller that passes nothing keeps today's behaviour: max(command timeout, 5 minutes)."""
+        from datetime import timedelta
+
+        make_env(timeout=30)
+        make_env(timeout=900)
+
+        assert vercel_sdk.create_kwargs[-2]["execution_time_limit"] == timedelta(minutes=5)
+        assert vercel_sdk.create_kwargs[-1]["execution_time_limit"] == timedelta(minutes=15)
+
+    def test_a_restored_sandbox_keeps_the_same_limit(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        from datetime import timedelta
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        vercel_module._store_snapshot("task-123", "snap_saved")
+
+        make_env(execution_time_limit="45m")
+
+        assert vercel_sdk.create_kwargs[-1]["execution_time_limit"] == timedelta(minutes=45)
+
+    @pytest.mark.parametrize("bad", ["30s", "0", "-1h", "45", "day", "25h", "2d", True])
+    def test_bad_limit_raises_before_any_sandbox_call(self, make_env, vercel_sdk, bad):
+        with pytest.raises(ValueError, match="execution time limit"):
+            make_env(execution_time_limit=bad)
+
+        assert vercel_sdk.create_kwargs == []
+
+    def test_recreate_warning_says_the_filesystem_is_gone(self, make_env, vercel_sdk, caplog):
+        """The silent part of the old behaviour was the transparency: a stopped sandbox came back
+        empty. The warning must name the loss and the knob that prevents it."""
+        env = make_env(execution_time_limit="45m")
+        vercel_sdk.current.status = _FakeSandboxStatus.STOPPED
+
+        env._ensure_sandbox_ready()
+
+        assert "entered state" in caplog.text
+        assert "$HOME/.hermes is gone" in caplog.text
+        assert "terminal.vercel_execution_time_limit" in caplog.text
+
+
+class TestExecutionTimeLimitConfig:
+    """The knob is a duration string parsed at config load, like the snapshot lifetime."""
+
+    @pytest.mark.parametrize("raw,expected", [("45m", 45), ("2h", 120), ("90s", 1.5), ("1d", 1440)])
+    def test_durations_parse_to_timedeltas(self, vercel_module, raw, expected):
+        from datetime import timedelta
+
+        from tools.terminal_tool_config import parse_execution_time_limit
+
+        assert parse_execution_time_limit(raw) == timedelta(minutes=expected)
+
+    def test_empty_and_none_mean_platform_default(self):
+        from tools.terminal_tool_config import parse_execution_time_limit
+
+        assert parse_execution_time_limit("") is None
+        assert parse_execution_time_limit(None) is None
+
+    def test_bad_value_is_a_config_error_at_startup(self):
+        from hermes_cli.config import validate_config_structure
+
+        issues = validate_config_structure({"terminal": {"vercel_execution_time_limit": "5"}})
+
+        errors = [i for i in issues if i.severity == "error"]
+        assert any("vercel_execution_time_limit" in i.message for i in errors)
+
+    def test_valid_value_is_not_flagged(self):
+        from hermes_cli.config import validate_config_structure
+
+        issues = validate_config_structure({"terminal": {"vercel_execution_time_limit": "45m"}})
+
+        assert not [i for i in issues if "vercel_execution_time_limit" in i.message]
+
+    def test_the_shipped_default_is_the_plan_ceiling(self):
+        """Not the platform's 5 minutes: the default has to be a value a real turn fits in."""
+        from datetime import timedelta
+
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+        from tools.terminal_tool_config import parse_execution_time_limit
+
+        assert parse_execution_time_limit(
+            DEFAULT_CONFIG["terminal"]["vercel_execution_time_limit"]) == timedelta(minutes=45)
+
+
+class TestSupersededSnapshotSweep:
+    """A persistent task stops once per turn and each stop leaves a ~800 MB snapshot. Vercel's
+    ``keepLastSnapshots`` counts per sandbox NAME and Hermes names every sandbox freshly, so it
+    evicts nothing (measured live); Hermes deletes the snapshot it supersedes itself."""
+
+    def test_the_previous_snapshot_is_deleted_after_the_new_one_is_stored(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        vercel_module._store_snapshot("task-123", "snap_previous")
+        env = make_env()
+        vercel_sdk.current.snapshot_id_on_stop = "snap_new"
+
+        env.cleanup()
+
+        assert vercel_sdk.deleted_snapshots == ["snap_previous"]
+        assert vercel_module._load_snapshots() == {"task-123": "snap_new"}
+
+    def test_the_new_snapshot_is_never_deleted(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        """A first teardown has nothing to supersede; deleting the id just stored would leave the
+        task with no restore point at all."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        env = make_env()
+        vercel_sdk.current.snapshot_id_on_stop = "snap_first"
+
+        env.cleanup()
+
+        assert vercel_sdk.deleted_snapshots == []
+        assert vercel_module._load_snapshots() == {"task-123": "snap_first"}
+
+    def test_a_failed_delete_keeps_the_new_snapshot_and_only_warns(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path, caplog
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        vercel_module._store_snapshot("task-123", "snap_previous")
+        vercel_sdk.delete_snapshot_side_effects.append(RuntimeError("delete failed"))
+        env = make_env()
+        vercel_sdk.current.snapshot_id_on_stop = "snap_new"
+
+        env.cleanup()
+
+        assert vercel_module._load_snapshots() == {"task-123": "snap_new"}
+        assert "could not delete superseded snapshot" in caplog.text
+
+    def test_ephemeral_teardown_deletes_nothing(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        vercel_module._store_snapshot("task-123", "snap_previous")
+        env = make_env(persistent_filesystem=False)
+
+        env.cleanup()
+
+        assert vercel_sdk.deleted_snapshots == []
+        # The stale pointer is left alone too: an ephemeral env has no snapshot of its own to
+        # replace it with, so dropping it would only lose a possible restore point.
+        assert vercel_module._load_snapshots() == {"task-123": "snap_previous"}
+
+    def test_create_sends_no_retention_policy(self, make_env, vercel_sdk):
+        """The platform policy cannot evict across freshly named sandboxes, so claiming it would
+        be a config that implies a guarantee it does not make."""
+        make_env(persistent_filesystem=True)
+
+        assert "snapshot_retention" not in vercel_sdk.create_kwargs[-1]
 
 
 class TestPersistentFlag:

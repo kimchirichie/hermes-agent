@@ -1060,7 +1060,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
             return [config_load_issue(exc)]
 
     from hermes_cli.config_value_checks import (
-        _validate_quoted_containers, _validate_timezone, _validate_vercel_snapshot_expiration,
+        _validate_quoted_containers, _validate_timezone, _validate_vercel_durations,
         _validate_voice, _validate_web_backends)
     issues: list[ConfigIssue] = []
     _validate_voice(config, issues)
@@ -1091,7 +1091,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
                    f"Move '{key}' under the appropriate section")
 
     _validate_web_backends(config, issues)
-    _validate_vercel_snapshot_expiration(config, issues)
+    _validate_vercel_durations(config, issues)
     _validate_quoted_containers(config, issues)
     return issues
 
@@ -2021,7 +2021,7 @@ TERMINAL_CONFIG_ENV_MAP = {
             "modal_mode", "degraded_mode", "cwd", "temp_dir", "timeout", "lifetime_seconds",
             "docker_image", "docker_forward_env", "modal_image",
             "daytona_image", "vercel_runtime", "vercel_image", "vercel_setup_script", "vercel_setup_timeout",
-            "vercel_snapshot_expiration",
+            "vercel_snapshot_expiration", "vercel_execution_time_limit",
             "ssh_host", "ssh_user", "ssh_port", "ssh_key",
             "container_cpu", "container_memory", "container_disk", "container_persistent",
             "docker_volumes", "docker_env", "docker_mount_cwd_to_workspace", "docker_network",

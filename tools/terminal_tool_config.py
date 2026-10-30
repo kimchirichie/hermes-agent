@@ -83,8 +83,44 @@ def profile_container_key(profile: str) -> str:
 # sandbox is created.
 SNAPSHOT_EXPIRATION_MIN = timedelta(days=1)
 SNAPSHOT_EXPIRATION_MAX = timedelta(days=3650)  # ten years
-_SNAPSHOT_EXPIRATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
-_SNAPSHOT_EXPIRATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhdwy])$", re.IGNORECASE)
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
+_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhdwy])$", re.IGNORECASE)
+
+# A sandbox's own lifetime (Vercel's ``execution_time_limit``) is not the same kind of knob as a
+# snapshot's: it is the wall clock the box is allowed to exist, and Vercel enforces it as a HARD
+# cap — a sandbox at its limit is stopped mid-process, not when it goes idle. A day is well past
+# any real turn and keeps a leaked box from living forever; a minute is the shortest useful value.
+EXECUTION_TIME_LIMIT_MIN = timedelta(minutes=1)
+EXECUTION_TIME_LIMIT_MAX = timedelta(hours=24)
+
+
+def _parse_duration(value: str | float | timedelta | None, label: str) -> timedelta | None:
+    """timedelta from a ``timedelta``, a number of seconds, or a ``<number><unit>`` string.
+
+    ``None``/``""`` means "unset" and returns ``None``; a bare ``0`` returns ``timedelta(0)``.
+    Range checks belong to the caller: the two Vercel durations accept different windows.
+    """
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        return value
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a duration, got {value!r}")
+    if isinstance(value, (int, float)):
+        return timedelta(seconds=value)
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a duration string, got {type(value).__name__}")
+    raw = value.strip().lower()
+    if not raw:
+        return None
+    match = _DURATION_RE.match(raw)
+    if not match:
+        if re.fullmatch(r"0+(?:\.0+)?", raw):
+            return timedelta(0)  # bare "0": the API's own zero case
+        raise ValueError(
+            f"{label} {value!r} is not a duration; use a number and a unit, "
+            "e.g. 45m, 2h, 1d (s, m, h, d, w, y)")
+    return timedelta(seconds=float(match.group(1)) * _DURATION_UNITS[match.group(2)])
 
 
 def parse_snapshot_expiration(value: str | float | timedelta | None) -> timedelta | None:
@@ -95,32 +131,34 @@ def parse_snapshot_expiration(value: str | float | timedelta | None) -> timedelt
     API's own convention. A nonzero value outside 1 day .. 10 years raises ValueError: the API
     would reject it anyway, and failing here keeps the error at config load with a fix hint.
     """
-    if value is None:
-        return None
-    if isinstance(value, timedelta):
-        delta = value
-    elif isinstance(value, bool):
-        raise ValueError(f"snapshot expiration must be a duration, got {value!r}")
-    elif isinstance(value, (int, float)):
-        delta = timedelta(seconds=value)
-    elif isinstance(value, str):
-        raw = value.strip().lower()
-        if not raw:
-            return None
-        match = _SNAPSHOT_EXPIRATION_RE.match(raw)
-        if not match:
-            if re.fullmatch(r"0+(?:\.0+)?", raw):
-                return timedelta(0)  # bare "0": never expire, the API's own zero case
-            raise ValueError(
-                f"snapshot expiration {value!r} is not a duration; use a number and a unit, "
-                "e.g. 1d, 36h, 2w (s, m, h, d, w, y)")
-        delta = timedelta(seconds=float(match.group(1)) * _SNAPSHOT_EXPIRATION_UNITS[match.group(2)])
-    else:
-        raise ValueError(f"snapshot expiration must be a duration string, got {type(value).__name__}")
+    delta = _parse_duration(value, "snapshot expiration")
     if delta and not SNAPSHOT_EXPIRATION_MIN <= delta <= SNAPSHOT_EXPIRATION_MAX:
         raise ValueError(
             f"snapshot expiration {value!r} is out of range: use 0 (never expire) or between "
             "1 day and 10 years (the Vercel Sandbox API's own limits)")
+    return delta
+
+
+def parse_execution_time_limit(value: str | float | timedelta | None) -> timedelta | None:
+    """Sandbox lifetime from a ``terminal.vercel_execution_time_limit`` value.
+
+    This is how long the cloud sandbox itself may live, not how long one command may run: Vercel
+    stops the box when the limit is reached, even mid-process, and Hermes then transparently
+    starts a new one — losing everything outside ``$HOME/.hermes`` (a cloned repo, a build tree).
+    The platform's own default is 5 minutes, which truncated real card turns, so Hermes sends a
+    longer one (``45m`` by default, the Hobby plan's session ceiling).
+
+    ``None``/``""`` means "send nothing and keep the platform default". A value must fall in
+    1 minute .. 24 hours; outside that it is a config typo, and failing at config load beats
+    failing on a create call.
+    """
+    delta = _parse_duration(value, "execution time limit")
+    if delta is None:
+        return None
+    if not EXECUTION_TIME_LIMIT_MIN <= delta <= EXECUTION_TIME_LIMIT_MAX:
+        raise ValueError(
+            f"execution time limit {value!r} is out of range: use 1 minute to 24 hours, "
+            "e.g. 45m or 2h")
     return delta
 
 

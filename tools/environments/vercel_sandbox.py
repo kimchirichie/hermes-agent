@@ -26,7 +26,7 @@ from hermes_constants import get_hermes_home
 from tools.environments.base import BaseEnvironment, _load_json_store, _update_json_store
 from tools.environments.base_output import _ThreadedProcessHandle
 from tools.environments.file_sync import FileSyncManager, iter_sync_files, quoted_rm_command
-from tools.terminal_tool_config import parse_snapshot_expiration
+from tools.terminal_tool_config import parse_execution_time_limit, parse_snapshot_expiration
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,9 @@ def _delete_snapshot(task_id: str, snapshot_id: str) -> None:
 
 
 def _extract_snapshot_id(snapshot: Any) -> str | None:
-    """Accept SDK objects or raw dicts; attribute lookup first, then dict keys."""
+    """A snapshot id from an id string, an SDK object or a raw dict: attributes first, then keys."""
+    if isinstance(snapshot, str):
+        return snapshot or None
     getters = [lambda k: getattr(snapshot, k, None)] + ([snapshot.get] if isinstance(snapshot, dict) else [])
     candidates = (get(key) for get in getters for key in ("snapshot_id", "snapshotId", "id"))
     return next((v for v in candidates if isinstance(v, str) and v), None)
@@ -276,7 +278,8 @@ class VercelSandboxEnvironment(BaseEnvironment):
                  persistent_filesystem: bool = True, task_id: str = "default",
                  image: str | None = None, setup_script: str | None = None,
                  setup_timeout: int = DEFAULT_VERCEL_SETUP_TIMEOUT,
-                 snapshot_expiration: str | float | timedelta | None = None):
+                 snapshot_expiration: str | float | timedelta | None = None,
+                 execution_time_limit: str | float | timedelta | None = None):
         super().__init__(cwd=cwd, timeout=timeout)
         if disk not in {0, _DEFAULT_CONTAINER_DISK_MB}:
             raise ValueError(
@@ -307,7 +310,16 @@ class VercelSandboxEnvironment(BaseEnvironment):
                            "vercel==0.12.0; ignoring %r and using terminal.vercel_image (default %s)",
                            runtime, DEFAULT_VERCEL_IMAGE)
         self._create_kwargs = {
-            "execution_time_limit": max(timedelta(seconds=max(self.timeout, 0)), timedelta(minutes=5)),
+            # How long the SANDBOX may live, not how long one command may run. Vercel enforces it
+            # as a hard cap (a box at its limit is stopped mid-process, not when it goes idle), and
+            # the platform default is 5 minutes — so a card doing a clone or a build lost its
+            # filesystem mid-turn: _ensure_sandbox_ready() silently recreated it and the agent
+            # carried on against an empty box. terminal.vercel_execution_time_limit raises it;
+            # without a configured value the old max(terminal.timeout, 5m) stands, so a caller that
+            # passes no limit keeps today's behaviour.
+            "execution_time_limit": (parse_execution_time_limit(execution_time_limit)
+                                     or max(timedelta(seconds=max(self.timeout, 0)),
+                                            _MIN_SANDBOX_TIMEOUT)),
             "image": image or DEFAULT_VERCEL_IMAGE,
             # Sent explicitly: the platform default is persistent=True, so a Hermes ephemeral sandbox
             # used to contradict container_persistent: false — every stop (and every hit of the
@@ -423,19 +435,54 @@ class VercelSandboxEnvironment(BaseEnvironment):
         with contextlib.suppress(Exception):
             sandbox.stop()
 
-    def _snapshot_sandbox(self, sandbox: SyncSandbox) -> None:
+    def _adopt_stop_snapshot(self, sandbox: SyncSandbox) -> None:
+        """Store the snapshot Vercel took when *sandbox* stopped, as this task's restore point.
+
+        A persistent sandbox gets an automatic snapshot on stop (the stop response carries it as
+        ``snapshot.creationMethod: "automatic"``, ~800 MB). Hermes used to take its own snapshot
+        BEFORE stopping, so every persistent teardown left two: the platform's plus the one keyed
+        in ``vercel_sandbox_snapshots.json``, against a single project-wide quota. The platform's
+        is now authoritative — it is the same filesystem, it costs one object instead of two, and
+        it exists even if this process dies instead of reaching cleanup(). So: read the id back
+        after the stop and key the task to it.
+        """
         if not self._persistent or not self._task_id:
             return
+        # Read the stopped sandbox back: the handle's own current_snapshot_id can still point at
+        # the snapshot a RESTORED sandbox was created from, which would key the task to its old
+        # (soon to be swept) snapshot. The live read after the stop reports the new one.
         try:
-            snapshot_id = _extract_snapshot_id(sandbox.snapshot())
+            stopped = self._vercel_client().get_sandbox(name=sandbox.name)
         except Exception as exc:
-            logger.warning("Vercel: filesystem snapshot failed for task %s: %s", self._task_id, exc)
+            logger.warning("Vercel: could not read back the stop snapshot for task %s (%s); it "
+                           "keeps its previous snapshot", self._task_id, exc)
             return
+        snapshot_id = _extract_snapshot_id(stopped.current_snapshot_id)
         if not snapshot_id:
-            logger.warning("Vercel: filesystem snapshot for task %s did not return a snapshot id", self._task_id)
+            logger.warning("Vercel: task %s stopped without a snapshot id; its next sandbox "
+                           "starts from scratch", self._task_id)
             return
+        previous = _load_snapshots().get(self._task_id)
         _store_snapshot(self._task_id, snapshot_id)
-        logger.info("Vercel: saved filesystem snapshot %s for task %s", snapshot_id, self._task_id)
+        logger.info("Vercel: task %s restored from the automatic stop snapshot %s",
+                    self._task_id, snapshot_id)
+        # One snapshot per task, or a long-lived task fills the project's single snapshot quota
+        # (~800 MB per turn, 30-day expiry). Vercel's own retention policy cannot do this: it
+        # counts per sandbox NAME and Hermes names every sandbox freshly, so nothing is ever
+        # evicted (measured live: a snapshot survived its child's creation with count=1).
+        if previous and previous != snapshot_id:
+            self._delete_superseded_snapshot(previous)
+
+    def _delete_superseded_snapshot(self, snapshot_id: str) -> None:
+        """Delete a task's previous snapshot; a failure is a warning, never a failed teardown."""
+        try:
+            # The 0.10 sync SDK deletes through the snapshot handle, not the client.
+            self._vercel_client().get_snapshot(snapshot_id=snapshot_id).delete()
+        except Exception as exc:
+            logger.warning("Vercel: could not delete superseded snapshot %s (it expires on its "
+                           "own): %s", snapshot_id, exc)
+            return
+        logger.info("Vercel: deleted superseded snapshot %s", snapshot_id)
 
     def _ensure_sandbox_ready(self) -> None:
         """Reuse a healthy sandbox; recreate when the refresh fails or it hit a terminal state."""
@@ -452,7 +499,10 @@ class VercelSandboxEnvironment(BaseEnvironment):
                 if not _is_terminal(status):
                     self._wait_for_running()
                     return
-                logger.warning("Vercel: sandbox entered state %s for task %s; recreating", status, self._task_id)
+                logger.warning("Vercel: sandbox %s entered state %s for task %s; creating a fresh one "
+                               "(anything outside $HOME/.hermes is gone — raise "
+                               "terminal.vercel_execution_time_limit if a turn needs longer)",
+                               sandbox.name, status, self._task_id)
             self._mark_recreated()
         self._attach_fresh_sandbox(requested_cwd)
 
@@ -568,9 +618,10 @@ class VercelSandboxEnvironment(BaseEnvironment):
             self._sync_manager = None
         if sandbox is None:
             return
-        self._snapshot_sandbox(sandbox)
-        # Always stop the sandbox during cleanup to avoid resource leaks (matches Modal/Daytona).
+        # Stop FIRST on a persistent env: the stop is what asks Vercel for the snapshot, so the
+        # id to remember does not exist until then (see _adopt_stop_snapshot).
         self._stop_sandbox(sandbox)
+        self._adopt_stop_snapshot(sandbox)
         client, self._client = self._client, None
         if client is not None:
             with contextlib.suppress(Exception):

@@ -47,8 +47,8 @@ from tools.terminal_tool_lifecycle import (
 from tools.terminal_tool_config import (
     _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
     _is_windows_drive_path, _parse_env_var, _plugin_env_flag, _quiet, _safe_getcwd, _tenv, _tenv_bool,
-    _in_sandbox_home, coerce_ssh_remote_cwd, home_profile_name, parse_snapshot_expiration,
-    profile_container_key, translate_mounted_host_path,
+    _in_sandbox_home, coerce_ssh_remote_cwd, home_profile_name, parse_execution_time_limit,
+    parse_snapshot_expiration, profile_container_key, translate_mounted_host_path,
 )
 from tools.terminal_tool_backends import (
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
@@ -900,6 +900,9 @@ def _get_env_config() -> dict[str, Any]:
         "vercel_snapshot_expiration": _parse_env_var(
             "TERMINAL_VERCEL_SNAPSHOT_EXPIRATION", "1d", parse_snapshot_expiration,
             "a duration like 1d, 36h or 2w, or 0 to never expire"),
+        "vercel_execution_time_limit": _parse_env_var(
+            "TERMINAL_VERCEL_EXECUTION_TIME_LIMIT", "45m", parse_execution_time_limit,
+            "a duration like 45m or 2h, between 1 minute and 24 hours"),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,

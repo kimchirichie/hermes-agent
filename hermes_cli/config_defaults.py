@@ -357,6 +357,13 @@ DEFAULT_CONFIG = {
         # A persistent filesystem keeps the platform default, since the task restores its own
         # snapshot later. "" leaves Vercel's default in place for ephemeral sandboxes too.
         "vercel_snapshot_expiration": "1d",
+        # vercel_sandbox backend only: how long a sandbox may LIVE, as a <number><unit> duration
+        # (s m h d w y, 1 minute to 24 hours). This is not terminal.timeout (one command) and not
+        # idle-based: Vercel stops the box when the limit is reached, even mid-process, and Hermes
+        # then creates a fresh one — losing everything outside $HOME/.hermes. The platform default
+        # is 5 minutes, which cut off real turns, so 45m (the Hobby plan's session ceiling) is sent
+        # explicitly. "" sends no limit at all, i.e. the platform's 5 minutes.
+        "vercel_execution_time_limit": "45m",
         # Container limits (docker, modal, daytona, vercel_sandbox, container plugin backends; not local/ssh).
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)

@@ -2005,6 +2005,7 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         "vercel_setup_script": "TERMINAL_VERCEL_SETUP_SCRIPT",
         "vercel_setup_timeout": "TERMINAL_VERCEL_SETUP_TIMEOUT",
         "vercel_snapshot_expiration": "TERMINAL_VERCEL_SNAPSHOT_EXPIRATION",
+        "vercel_execution_time_limit": "TERMINAL_VERCEL_EXECUTION_TIME_LIMIT",
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",

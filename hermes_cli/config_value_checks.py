@@ -75,25 +75,39 @@ def _validate_web_backends(config: dict[str, Any], issues: list[ConfigIssue]) ->
                    "Run 'hermes tools' and pick a different Web Search & Extract provider")
 
 
-def _validate_vercel_snapshot_expiration(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
-    """``terminal.vercel_snapshot_expiration`` must be a duration Vercel would accept.
+# ``terminal.<key>`` durations the Vercel backend accepts, with the parser that owns each range
+# and the fix hint shown when the value is rejected.
+_VERCEL_DURATION_KEYS = {
+    "vercel_snapshot_expiration": (
+        "parse_snapshot_expiration",
+        "Use a <number><unit> duration: 0 (never expire) or 1 day to 10 years, "
+        "e.g. 1d, 36h, 2w. Leave it empty to keep Vercel's 30-day default."),
+    "vercel_execution_time_limit": (
+        "parse_execution_time_limit",
+        "Use a <number><unit> duration between 1 minute and 24 hours, e.g. 45m, 2h. "
+        "Leave it empty to keep Vercel's own 5-minute default."),
+}
+
+
+def _validate_vercel_durations(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
+    """``terminal.vercel_*_expiration|limit`` must be durations Vercel would accept.
 
     A bad value would otherwise fail when a sandbox is created (or, worse, past that point on
-    the platform side), and the Vercel backend's range is not obvious: 0 (never expire) or
-    1 day to 10 years, so the tempting "1h" is invalid.
+    the platform side), and the Vercel ranges are not obvious: a snapshot is 0 (never expire) or
+    1 day to 10 years, so the tempting "1h" is invalid there, while a sandbox lifetime is
+    1 minute to 24 hours and has no zero case.
     """
     terminal_cfg = config.get("terminal")
-    if not isinstance(terminal_cfg, dict) or "vercel_snapshot_expiration" not in terminal_cfg:
+    if not isinstance(terminal_cfg, dict):
         return
-    raw = terminal_cfg.get("vercel_snapshot_expiration")
-    try:
-        from tools.terminal_tool_config import parse_snapshot_expiration
-        parse_snapshot_expiration(raw)
-    except Exception as exc:
-        _issue(issues, "error",
-               f"terminal.vercel_snapshot_expiration is invalid: {exc}",
-               "Use a <number><unit> duration: 0 (never expire) or 1 day to 10 years, "
-               "e.g. 1d, 36h, 2w. Leave it empty to keep Vercel's 30-day default.")
+    from tools import terminal_tool_config
+    for key, (parser_name, hint) in _VERCEL_DURATION_KEYS.items():
+        if key not in terminal_cfg:
+            continue
+        try:
+            getattr(terminal_tool_config, parser_name)(terminal_cfg.get(key))
+        except Exception as exc:
+            _issue(issues, "error", f"terminal.{key} is invalid: {exc}", hint)
 
 
 def _container_slots() -> dict[str, str]:
