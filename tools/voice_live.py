@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
@@ -123,8 +124,26 @@ def _resolve_credentials(live: dict[str, Any]) -> tuple[str, str]:
     return api_key, base_url
 
 
+def _read_instructions_file(path: str) -> str:
+    """Persona text from disk, so a long prompt can live in markdown instead of config."""
+    expanded = os.path.expanduser(path.strip())
+    try:
+        with open(expanded, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError as exc:
+        logger.warning("voice.gpt_live.instructions_file unreadable (%s): %s; "
+                       "falling back to voice.gpt_live.instructions", expanded, exc)
+        return ""
+
+
 def live_instructions(live: Optional[dict[str, Any]] = None) -> str:
-    extra = str((live if live is not None else _live_section()).get("instructions") or "").strip()
+    section = live if live is not None else _live_section()
+    extra = ""
+    file_path = str(section.get("instructions_file") or "").strip()
+    if file_path:
+        extra = _read_instructions_file(file_path)
+    if not extra:
+        extra = str(section.get("instructions") or "").strip()
     return f"{LIVE_PERSONA}\n\n{extra}" if extra else LIVE_PERSONA
 
 
