@@ -15,7 +15,11 @@ import { delegationPrompt, useVoiceLiveConversation } from './use-voice-live-con
 // The transport is the only seam in the live hook, so the fake session records
 // the handlers it registers (tests drive the close/error paths directly) and
 // lets `start` reject with exactly what the real `getUserMedia` would throw.
-const transport = vi.hoisted(() => ({ failure: null as unknown, handlers: [] as VoiceLiveHandlers[] }))
+const transport = vi.hoisted(() => ({
+  failure: null as unknown,
+  handlers: [] as VoiceLiveHandlers[],
+  sessions: [] as Array<{ speak: ReturnType<typeof vi.fn>; think: ReturnType<typeof vi.fn> }>
+}))
 
 vi.mock('@/lib/voice-live', async importOriginal => {
   const actual = (await importOriginal()) as Record<string, unknown>
@@ -31,6 +35,7 @@ vi.mock('@/lib/voice-live', async importOriginal => {
 
       constructor(handlers: VoiceLiveHandlers) {
         transport.handlers.push(handlers)
+        transport.sessions.push(this)
       }
 
       async start(): Promise<void> {
@@ -82,6 +87,7 @@ function resetToasts() {
   clearNotifications()
   transport.failure = null
   transport.handlers.length = 0
+  transport.sessions.length = 0
 }
 
 describe('Voice-live toast copy', () => {
@@ -162,5 +168,124 @@ describe('GPT-Live delegation → Hermes turn', () => {
     expect(history.at(-1)?.content[0]?.text).toBe('turn 39')
     expect(history[0]?.role).toBe('user')
     expect(history.find(m => m.role === 'assistant')?.content[0]?.type).toBe('output_text')
+  })
+})
+
+// A turn that ends with nothing to say (the delegation 404s, the turn is
+// interrupted, every tool call fails) used to be reported with `think`, which
+// the live model never reads aloud — so it filled the silence itself and told
+// the user the request had succeeded (MS journey 1285, 2026-11-02). The failure
+// has to be spoken, and only when the turn did not already speak.
+describe('GPT-Live turn settling without a reply', () => {
+  const SETTLE_MS = 16_000
+
+  beforeEach(() => {
+    resetToasts()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    resetToasts()
+  })
+
+  async function openLiveSession(busy = false) {
+    const hook = renderHook(
+      ({ isBusy }: { isBusy: boolean }) =>
+        useVoiceLiveConversation({
+          busy: isBusy,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          onSubmit: vi.fn(),
+          pendingResponse: () => null,
+          seedHistory: () => []
+        }),
+      { initialProps: { isBusy: busy } }
+    )
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+
+    return {
+      handlers: transport.handlers.at(-1) as VoiceLiveHandlers,
+      hook,
+      session: transport.sessions.at(-1) as { speak: ReturnType<typeof vi.fn>; think: ReturnType<typeof vi.fn> }
+    }
+  }
+
+  it('speaks the failure when a delegated turn settles with nothing spoken', async () => {
+    const { handlers, session } = await openLiveSession()
+
+    act(() => {
+      handlers.onDelegation('del-404', [])
+    })
+
+    await act(async () => {
+      vi.advanceTimersByTime(SETTLE_MS)
+    })
+
+    expect(session.speak).toHaveBeenCalledWith('del-404', 'That did not go through.')
+    // The old wording only ever reached the model as silent context.
+    expect(session.think).not.toHaveBeenCalledWith('del-404', expect.stringContaining('spoken result'))
+  })
+
+  it('does not report a turn that already spoke its reply', async () => {
+    let response: null | { id: string; pending: boolean; text: string } = null
+
+    const hook = renderHook(() =>
+      useVoiceLiveConversation({
+        busy: false,
+        consumePendingResponse: () => {
+          response = null
+        },
+        enabled: true,
+        onSubmit: vi.fn(),
+        pendingResponse: () => response,
+        seedHistory: () => []
+      })
+    )
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+
+    const handlers = transport.handlers.at(-1) as VoiceLiveHandlers
+    const session = transport.sessions.at(-1) as { speak: ReturnType<typeof vi.fn> }
+
+    act(() => {
+      handlers.onDelegation('del-ok', [])
+    })
+
+    response = { id: 'reply-1', pending: false, text: 'The update is in.' }
+
+    await act(async () => {
+      vi.advanceTimersByTime(SETTLE_MS)
+    })
+
+    expect(session.speak).toHaveBeenCalledWith('del-ok', 'The update is in.')
+    expect(session.speak).not.toHaveBeenCalledWith('del-ok', 'That did not go through.')
+  })
+
+  it('speaks a superseded notice for the turn a newer delegation interrupted', async () => {
+    const { handlers, hook, session } = await openLiveSession()
+
+    act(() => {
+      handlers.onDelegation('del-first', [])
+    })
+
+    await act(async () => {
+      hook.rerender({ isBusy: true })
+    })
+
+    act(() => {
+      handlers.onDelegation('del-second', [])
+    })
+
+    expect(session.speak).toHaveBeenCalledWith(
+      'del-first',
+      'That request was replaced by your newer one, so it did not go through.'
+    )
   })
 })
