@@ -307,9 +307,18 @@ export function useVoiceLiveConversation({
           }
 
           // A newer request supersedes an in-flight turn: stop it so the answer
-          // the voice speaks is for what the user asked last.
+          // the voice speaks is for what the user asked last. That interrupted
+          // turn never settles with a reply of its own, so say so on its behalf:
+          // `think` is never spoken, and the silence lets the live model claim
+          // the interrupted request succeeded.
           if (busyRef.current) {
+            const supersededId = delegationRef.current
+
             void latest.current.onInterrupt?.()
+
+            if (supersededId && spokenLengthRef.current === 0) {
+              session.speak(supersededId, 'That request was replaced by your newer one, so it did not go through.')
+            }
           }
 
           setDelegation(delegationId)
@@ -446,8 +455,12 @@ export function useVoiceLiveConversation({
         (turnObservedRef.current || Date.now() - submittedAtRef.current > SUBMIT_SETTLE_GRACE_MS)
       ) {
         // Turn settled without a speakable reply (tool-only, error, interrupted).
+        // This has to be SPOKEN: `think` is never read aloud, so the live model
+        // hears nothing here and fills the silence from its own context —
+        // announcing a success Hermes never reported (MS journey 1285, the 404
+        // turn, said the update went through).
         if (spokenLengthRef.current === 0) {
-          session.think(delegationId, 'Hermes finished that request without a spoken result.')
+          session.speak(delegationId, 'That did not go through.')
         }
 
         setDelegation(null)
