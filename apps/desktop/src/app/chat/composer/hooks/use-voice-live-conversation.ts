@@ -6,6 +6,7 @@ import { type LiveHistoryMessage, type LiveTranscriptFragment, VoiceLiveSession 
 import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { notify, notifyError } from '@/store/notifications'
 
+import type { SteerOutcome } from '../busy-submit-state'
 import { useComposerScope } from '../scope'
 
 import { micError } from './use-mic-recorder'
@@ -17,6 +18,12 @@ const SUBMIT_SETTLE_GRACE_MS = 15_000
  *  as a whole ("stop" ends the chat; "stop the container" is a request). */
 const UTTERANCE_SETTLE_MS = 1_500
 
+/** Spoken on the delegation the live model just created when the words could
+ *  not reach the running turn. `think` is never read aloud, and silence lets
+ *  the live model claim the request went through (the settle-path lesson). */
+const QUEUED_NOTICE = 'That request is queued for right after the one already running.'
+const UNDELIVERED_NOTICE = 'Sorry, I could not pass that through while the current request is still running.'
+
 interface PendingVoiceResponse {
   id: string
   pending: boolean
@@ -27,9 +34,14 @@ interface VoiceLiveConversationOptions {
   busy: boolean
   enabled: boolean
   onFatalError?: () => void
-  /** Interrupt the in-flight Hermes turn (Stop-button seam). Fired when a new
-   *  delegation supersedes one still running. */
-  onInterrupt?: () => Promise<void> | void
+  /**
+   * Steer the running Hermes turn with the words the user just spoke — the
+   * composer's steer seam. Voice never interrupts a turn: a spoken correction
+   * mid-turn redirects it (the composer's Steer action, not its Stop button),
+   * and a steer that cannot carry the words queues them as the next turn. The
+   * outcome decides which delegation the reply is reported under.
+   */
+  onSteer?: (text: string) => Promise<SteerOutcome> | SteerOutcome
   onStopWord?: () => void
   /** Submit a Hermes turn: `text` is the user's last words (the bubble and the
    *  persisted row), `voiceContext` the recent spoken exchange for the model. */
@@ -105,7 +117,7 @@ export function useVoiceLiveConversation({
   busy,
   enabled,
   onFatalError,
-  onInterrupt,
+  onSteer,
   onStopWord,
   onSubmit,
   pendingResponse,
@@ -148,12 +160,15 @@ export function useVoiceLiveConversation({
   const spokenResponseIdRef = useRef<null | string>(null)
   const lastToolLabelRef = useRef<null | string>(null)
   const wasEnabledRef = useRef(enabled)
+  // Last spoken correction wins: a second utterance arriving while the first
+  // steer is still in flight supersedes it.
+  const steerSeqRef = useRef(0)
 
   const latest = useRef({
     activeToolLabel,
     beforeMicOpen,
     onFatalError,
-    onInterrupt,
+    onSteer,
     onStopWord,
     onSubmit,
     pendingResponse,
@@ -165,7 +180,7 @@ export function useVoiceLiveConversation({
     activeToolLabel,
     beforeMicOpen,
     onFatalError,
-    onInterrupt,
+    onSteer,
     onStopWord,
     onSubmit,
     pendingResponse,
@@ -246,6 +261,51 @@ export function useVoiceLiveConversation({
       return
     }
 
+    /**
+     * A spoken correction while a turn is running: steer it, never interrupt
+     * it. `delegationId` is the delegation the live model just created and is
+     * waiting on, so the running turn's reply is reported under it once the
+     * steer lands.
+     */
+    const steerRunningTurn = async (live: VoiceLiveSession, delegationId: string, prompt: string) => {
+      const seq = ++steerSeqRef.current
+      let outcome: SteerOutcome = false
+
+      try {
+        outcome = (await latest.current.onSteer?.(prompt)) ?? false
+      } catch {
+        outcome = false
+      }
+
+      // The conversation ended, or a newer correction superseded this one.
+      if (sessionRef.current !== live || steerSeqRef.current !== seq) {
+        return
+      }
+
+      if (outcome === 'steered') {
+        // The running turn carries the correction now, so its reply answers the
+        // delegation the live model is waiting on — report it under that one.
+        //
+        // The spoken cursor is deliberately NOT reset: a steer seals the live
+        // bubble and the answer continues in a new one, so every word already
+        // spoken is still in the collected turn text. Restarting the cursor
+        // would say the whole running turn again; it keeps reading from where
+        // it stopped, so the user hears only the correction's tail.
+        setDelegation(delegationId)
+        turnObservedRef.current = true
+        submittedAtRef.current = Date.now()
+        refreshStatus()
+
+        return
+      }
+
+      // The words never reached the running turn (queued as the next one, or
+      // refused outright). Say so on the delegation the live model awaits:
+      // `think` would be silent, and silence lets the model claim the request
+      // went through.
+      live.speak(delegationId, outcome === 'queued' ? QUEUED_NOTICE : UNDELIVERED_NOTICE)
+    }
+
     const session = new VoiceLiveSession(
       {
         // The voice model answers a bare "stop" itself (it just goes quiet) and
@@ -306,19 +366,16 @@ export function useVoiceLiveConversation({
             return
           }
 
-          // A newer request supersedes an in-flight turn: stop it so the answer
-          // the voice speaks is for what the user asked last. That interrupted
-          // turn never settles with a reply of its own, so say so on its behalf:
-          // `think` is never spoken, and the silence lets the live model claim
-          // the interrupted request succeeded.
+          // A newer request while a turn is running is a correction, not a
+          // reason to throw work away: it STEERS the running turn — the same
+          // policy the text composer follows (`busy_input_mode: steer`).
+          // Nothing on this path interrupts: the old code called onInterrupt
+          // here, which killed whatever Hermes was doing mid-tool and let the
+          // voice answer a request that had been abandoned.
           if (busyRef.current) {
-            const supersededId = delegationRef.current
+            void steerRunningTurn(session, delegationId, prompt)
 
-            void latest.current.onInterrupt?.()
-
-            if (supersededId && spokenLengthRef.current === 0) {
-              session.speak(supersededId, 'That request was replaced by your newer one, so it did not go through.')
-            }
+            return
           }
 
           setDelegation(delegationId)

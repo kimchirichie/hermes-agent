@@ -263,7 +263,7 @@ The voice model never forces a compaction: when the conversation is already larg
 
 You can interrupt the agent at ANY point in its turn — the microphone stays live from the moment you finish speaking until the reply has fully played (full duplex):
 
-- **Interject while it's thinking** — in continuous voice mode, speaking during LLM generation (before any audio plays) interrupts the in-flight turn and your interjection becomes the next message, the same as typing over a running turn.
+- **Interject while it's thinking** — in continuous voice mode, speaking during LLM generation (before any audio plays) interrupts the in-flight turn and your interjection becomes the next message, the same as typing over a running turn. The Desktop app instead steers: a spoken interjection mid-turn is injected into the running turn (the same steer path as the composer's Steer action), so the work keeps going and takes the correction; if that turn is already finishing, the words queue as the next message.
 - **Talk over it** — speaking while the agent's reply plays cuts playback the moment you start talking and submits what you said. The detector calibrates its noise floor against the *quiet room* at turn start (never against the playback itself), so speaker bleed can't deafen it and normal speech reliably trips it.
 - **Type or press the record key** — sending a new message or hitting the push-to-talk key stops playback instantly on every surface.
 - **Say "stop"** — the stop phrase works in both phases: mid-generation it interrupts the turn AND ends the voice chat; mid-playback it cuts the speech and ends the chat.
