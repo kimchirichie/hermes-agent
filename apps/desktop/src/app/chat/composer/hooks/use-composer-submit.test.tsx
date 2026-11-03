@@ -673,6 +673,29 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onSteer).not.toHaveBeenCalled()
     expect(queueCurrentDraft).not.toHaveBeenCalled()
   })
+
+  it('keeps the typed words when the Steer button refuses a restored @terminal chip', () => {
+    clearComposerTerminalSelections()
+
+    const draft = 'look at @terminal:`zsh:23-58`'
+
+    const { clearDraft, editor, hook, loadIntoComposer, onSteer, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      text: draft
+    })
+
+    act(() => {
+      hook.result.current.steerDraft('steer')
+    })
+
+    // Refused before the draft is touched: nothing steered, nothing queued, and
+    // the only copy of the correction is still in the composer (#68927).
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+    expect(clearDraft).not.toHaveBeenCalled()
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(editor.textContent).toBe(draft)
+  })
 })
 
 describe('useComposerSubmit keyboard after send', () => {
@@ -1320,5 +1343,26 @@ describe('useComposerSubmit voice steer seam', () => {
 
     expect(outcome).toBe(false)
     expect(onSteer).not.toHaveBeenCalled()
+  })
+
+  // The live voice model treats `false` as "not delivered" and says so aloud; a
+  // `@terminal:` chip with no selection must not be called queued when nothing
+  // was kept anywhere.
+  it('reports a missing @terminal selection as not delivered, not queued', async () => {
+    clearComposerTerminalSelections()
+
+    const { hook, loadIntoComposer, onSteer, onSubmit } = renderSubmitHook({ busy: true })
+
+    let outcome: 'queued' | 'steered' | false = 'queued'
+
+    await act(async () => {
+      outcome = await hook.result.current.steerText('look at @terminal:`zsh:23-58`')
+    })
+
+    expect(outcome).toBe(false)
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(loadIntoComposer).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('stored-session')).toEqual([])
   })
 })

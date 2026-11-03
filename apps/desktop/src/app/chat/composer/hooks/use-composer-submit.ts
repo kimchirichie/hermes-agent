@@ -557,8 +557,16 @@ export function useComposerSubmit({
    * refusal handling: a steer that cannot carry the words keeps them for the
    * next turn, so nothing spoken is lost. Resolves with what happened, so the
    * voice can tell the live model whether the correction reached the turn.
+   *
+   * `options.onCarry` runs once the steer is certain to carry the words (past
+   * the transport freeze), for a caller holding its own copy — the draft's
+   * Steer button drops it there so a refused chip selection keeps the text.
    */
-  const steerText = (text: string, mode: 'interrupt' | 'steer' = 'steer'): Promise<SteerOutcome> => {
+  const steerText = (
+    text: string,
+    mode: 'interrupt' | 'steer' = 'steer',
+    options?: { onCarry?: () => void }
+  ): Promise<SteerOutcome> => {
     const trimmed = text.trim()
 
     if (!onSteer || attachments.length > 0 || !isSteerableTextValue(trimmed)) {
@@ -578,6 +586,11 @@ export function useComposerSubmit({
 
       return Promise.resolve(false)
     }
+
+    // The steer can carry the words now, so the caller may drop its own copy.
+    // This must stay AFTER the freeze guard: clearing first would wipe the only
+    // copy of a draft whose `@terminal:` chip has no selection (#68927).
+    options?.onCarry?.()
 
     const submittedScope = activeQueueSessionKeyRef.current
 
@@ -649,9 +662,15 @@ export function useComposerSubmit({
       return
     }
 
-    triggerHaptic('submit')
-    clearDraft()
-    void steerText(text, mode)
+    // Clear the draft only once the steer can actually carry it: `steerText`
+    // calls `onCarry` past its freeze guard, so a `@terminal:` chip with no
+    // selection leaves the typed words in the composer instead of eating them.
+    void steerText(text, mode, {
+      onCarry: () => {
+        triggerHaptic('submit')
+        clearDraft()
+      }
+    })
   }
 
   const queueDraft = () => {
