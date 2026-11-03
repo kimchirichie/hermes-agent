@@ -23,6 +23,7 @@ import { $voiceLiveStatus, refreshVoiceLiveStatus, selectedVoiceChatMode } from 
 import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
 import { resumeWakeAfterVoice } from '@/store/wake-word'
 
+import type { SteerOutcome } from '../busy-submit-state'
 import { pinFloatingComposerCapture } from '../floating-target'
 import type { ComposerTarget } from '../focus'
 import { onComposerDictationRequest, onComposerVoiceToggleRequest } from '../focus'
@@ -41,9 +42,14 @@ interface UseComposerVoiceArgs {
   focusInput: () => void
   insertText: (text: string) => void
   maxRecordingSeconds: number
-  /** Interrupt the in-flight agent turn (Stop-button seam) — fired when the
-   *  user speaks over the model while it is still generating. */
-  onInterrupt?: () => Promise<void> | void
+  /**
+   * Redirect the running Hermes turn with words the user just spoke — the
+   * composer's steer seam. Voice never interrupts a turn: the correction
+   * steers it, and when a steer cannot carry the words they queue as the next
+   * turn (see `SteerOutcome`). Same policy as the text composer's
+   * `busy_input_mode: steer`.
+   */
+  onSteer?: (text: string) => Promise<SteerOutcome> | SteerOutcome
   onSubmit: ChatBarProps['onSubmit']
   onTranscribeAudio: ChatBarProps['onTranscribeAudio']
   sessionId: string | null | undefined
@@ -65,7 +71,7 @@ export function useComposerVoice({
   focusInput,
   insertText,
   maxRecordingSeconds,
-  onInterrupt,
+  onSteer,
   onSubmit,
   onTranscribeAudio,
   sessionId,
@@ -221,10 +227,11 @@ export function useComposerVoice({
     consumePendingResponse,
     enabled: voiceConversationActive && !liveEngineActive,
     onFatalError: () => setVoiceConversationActive(false),
-    // Speaking over the model mid-generation interrupts the in-flight turn —
-    // the same seam as the Stop button — so the interjection becomes the next
-    // turn instead of waiting behind a reply the user already rejected.
-    onInterrupt,
+    // Speaking over the model mid-generation steers the running turn instead
+    // of interrupting it — the same policy as the text composer. The captured
+    // utterance is injected into the turn; if a steer cannot carry it, the
+    // composer queues it as the next turn.
+    onSteer,
     // A spoken stop command ("stop", "never mind", "goodbye", …) ends the
     // hands-free conversation. Flipping the flag is the authoritative off
     // switch — the enabled=false prop + effect below drive conversation.end()
@@ -245,7 +252,7 @@ export function useComposerVoice({
     consumePendingResponse,
     enabled: voiceConversationActive && liveEngineActive,
     onFatalError: () => setVoiceConversationActive(false),
-    onInterrupt,
+    onSteer,
     onStopWord: () => setVoiceConversationActive(false),
     onSubmit: submitLiveDelegation,
     pendingResponse: pendingTurnResponse,

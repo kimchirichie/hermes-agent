@@ -190,15 +190,26 @@ describe('GPT-Live turn settling without a reply', () => {
     resetToasts()
   })
 
-  async function openLiveSession(busy = false) {
+  async function openLiveSession(
+    busy = false,
+    overrides: {
+      consumePendingResponse?: () => void
+      onSteer?: (text: string) => Promise<'queued' | 'steered' | false> | 'queued' | 'steered' | false
+      onStopWord?: () => void
+      onSubmit?: (text: string, voiceContext: string) => Promise<void> | void
+      pendingResponse?: () => null | { id: string; pending: boolean; text: string }
+    } = {}
+  ) {
     const hook = renderHook(
       ({ isBusy }: { isBusy: boolean }) =>
         useVoiceLiveConversation({
           busy: isBusy,
-          consumePendingResponse: vi.fn(),
+          consumePendingResponse: overrides.consumePendingResponse ?? vi.fn(),
           enabled: true,
-          onSubmit: vi.fn(),
-          pendingResponse: () => null,
+          onSteer: overrides.onSteer,
+          onStopWord: overrides.onStopWord,
+          onSubmit: overrides.onSubmit ?? vi.fn(),
+          pendingResponse: overrides.pendingResponse ?? (() => null),
           seedHistory: () => []
         }),
       { initialProps: { isBusy: busy } }
@@ -268,11 +279,13 @@ describe('GPT-Live turn settling without a reply', () => {
     expect(session.speak).not.toHaveBeenCalledWith('del-ok', 'That did not go through.')
   })
 
-  it('speaks a superseded notice for the turn a newer delegation interrupted', async () => {
-    const { handlers, hook, session } = await openLiveSession()
+  it('steers the running turn when the user speaks again mid-turn — it never interrupts it', async () => {
+    const onSteer = vi.fn(async () => 'steered' as const)
+    const onSubmit = vi.fn()
+    const { handlers, hook, session } = await openLiveSession(false, { onSteer, onSubmit })
 
     act(() => {
-      handlers.onDelegation('del-first', [])
+      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
     })
 
     await act(async () => {
@@ -280,12 +293,189 @@ describe('GPT-Live turn settling without a reply', () => {
     })
 
     act(() => {
-      handlers.onDelegation('del-second', [])
+      handlers.onDelegation('del-second', [
+        { endMs: 2_000, speaker: 'user', startMs: 1_000, text: 'start the import' },
+        { endMs: 2_500, speaker: 'assistant', startMs: 2_000, text: 'On it.' },
+        { endMs: 3_000, speaker: 'user', startMs: 2_500, text: 'and skip the archive step' }
+      ])
     })
 
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(onSteer).toHaveBeenCalledTimes(1)
+    expect(onSteer).toHaveBeenCalledWith('and skip the archive step')
+    // The correction reached the running turn: no second Hermes turn, and the
+    // old turn is not declared dead ("that request was replaced…" is gone).
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(session.speak).not.toHaveBeenCalled()
+  })
+
+  it('reports the steered turn under the delegation the live model is waiting on', async () => {
+    let response: null | { id: string; pending: boolean; text: string } = null
+
+    const onSteer = vi.fn(async () => 'steered' as const)
+
+    const { handlers, hook, session } = await openLiveSession(false, {
+      consumePendingResponse: () => {
+        response = null
+      },
+      onSteer,
+      pendingResponse: () => response
+    })
+
+    act(() => {
+      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
+    })
+
+    await act(async () => {
+      hook.rerender({ isBusy: true })
+    })
+
+    act(() => {
+      handlers.onDelegation('del-second', [
+        { endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' },
+        { endMs: 1_500, speaker: 'assistant', startMs: 1_000, text: 'On it.' },
+        { endMs: 2_000, speaker: 'user', startMs: 1_500, text: 'and skip the archive step' }
+      ])
+    })
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    response = { id: 'reply-steered', pending: false, text: 'Imported, and the archive step was skipped.' }
+
+    await act(async () => {
+      // The steered turn settles, then its answer lands.
+      hook.rerender({ isBusy: false })
+    })
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_000)
+    })
+
+    // The answer is for what the user asked LAST, so it rides the newest
+    // delegation — the one the live model is awaiting.
+    expect(session.speak).toHaveBeenCalledWith('del-second', 'Imported, and the archive step was skipped.')
+    expect(session.speak).not.toHaveBeenCalledWith('del-first', expect.anything())
+  })
+
+  it('keeps reading from where it stopped after a steer — the running turn is not repeated', async () => {
+    // A steer seals the live bubble and the answer continues in a new one, so
+    // the collected turn text only GROWS (same first bubble id). Restarting the
+    // spoken cursor on the steer would say everything already spoken again.
+    let response: null | { id: string; pending: boolean; text: string } = null
+
+    const onSteer = vi.fn(async () => 'steered' as const)
+
+    const { handlers, hook, session } = await openLiveSession(false, {
+      onSteer,
+      pendingResponse: () => response
+    })
+
+    act(() => {
+      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
+    })
+
+    await act(async () => {
+      hook.rerender({ isBusy: true })
+    })
+
+    response = { id: 'bubble-1', pending: true, text: 'Reading the export now. Checking rows.' }
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_000)
+    })
+
+    expect(session.speak).toHaveBeenCalledWith('del-first', 'Reading the export now.')
+
+    act(() => {
+      handlers.onDelegation('del-second', [
+        { endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' },
+        { endMs: 1_500, speaker: 'assistant', startMs: 1_000, text: 'On it.' },
+        { endMs: 2_000, speaker: 'user', startMs: 1_500, text: 'and skip the archive step' }
+      ])
+    })
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    response = {
+      id: 'bubble-1',
+      pending: true,
+      text: 'Reading the export now. Checking rows.\n\nThe archive step is skipped. Next up.'
+    }
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_000)
+    })
+
+    const spokenAfterSteer = session.speak.mock.calls
+      .filter(([delegation]) => delegation === 'del-second')
+      .map(([, text]) => text)
+      .join(' ')
+
+    expect(spokenAfterSteer).toContain('archive step is skipped')
+    expect(spokenAfterSteer).not.toContain('Reading the export now')
+  })
+
+  it('queues the words and says so when a steer cannot carry them', async () => {
+    const onSteer = vi.fn(async () => 'queued' as const)
+    const onSubmit = vi.fn()
+    const { handlers, hook, session } = await openLiveSession(false, { onSteer, onSubmit })
+
+    act(() => {
+      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
+    })
+
+    await act(async () => {
+      hook.rerender({ isBusy: true })
+    })
+
+    act(() => {
+      handlers.onDelegation('del-second', [
+        { endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' },
+        { endMs: 1_500, speaker: 'assistant', startMs: 1_000, text: 'On it.' },
+        { endMs: 2_000, speaker: 'user', startMs: 1_500, text: 'and skip the archive step' }
+      ])
+    })
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // The words were kept for the next turn, and the live model is told so on
+    // the delegation it awaits: silence here is what makes it invent a success.
+    expect(onSteer).toHaveBeenCalledWith('and skip the archive step')
+    expect(onSubmit).toHaveBeenCalledTimes(1)
     expect(session.speak).toHaveBeenCalledWith(
-      'del-first',
-      'That request was replaced by your newer one, so it did not go through.'
+      'del-second',
+      'That request is queued for right after the one already running.'
     )
+  })
+
+  it('still ends the conversation on a spoken stop word while a turn is running', async () => {
+    const onSteer = vi.fn(async () => 'steered' as const)
+    const onStopWord = vi.fn()
+    const { handlers, hook } = await openLiveSession(false, { onSteer, onStopWord })
+
+    act(() => {
+      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
+    })
+
+    await act(async () => {
+      hook.rerender({ isBusy: true })
+    })
+
+    act(() => {
+      handlers.onDelegation('del-stop', [{ endMs: 2_000, speaker: 'user', startMs: 1_000, text: 'stop' }])
+    })
+
+    expect(onStopWord).toHaveBeenCalledTimes(1)
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(hook.result.current.status).toBe('idle')
   })
 })

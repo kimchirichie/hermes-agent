@@ -20,6 +20,7 @@ import { notify, notifyError } from '@/store/notifications'
 import { $voicePlayback } from '@/store/voice-playback'
 import { $autoSpeakReplies, $bargeInEnabled, $bargeInThresholdMultiplier, $voiceSilenceMs } from '@/store/voice-prefs'
 
+import type { SteerOutcome } from '../busy-submit-state'
 import { useComposerScope } from '../scope'
 
 import { useMicRecorder } from './use-mic-recorder'
@@ -36,9 +37,13 @@ interface VoiceConversationOptions {
   busy: boolean
   enabled: boolean
   onFatalError?: () => void
-  /** Interrupt the in-flight agent turn (the same seam as the Stop button).
-   *  Fired when the user speaks while the model is still generating. */
-  onInterrupt?: () => Promise<void> | void
+  /**
+   * Steer the running turn with the utterance a barge captured — the same
+   * policy as the text composer's Steer action. Voice never interrupts a turn;
+   * when a steer cannot carry the words they queue as the next turn (see
+   * `SteerOutcome`).
+   */
+  onSteer?: (text: string) => Promise<SteerOutcome> | SteerOutcome
   onStopWord?: () => void
   onSubmit: (text: string) => Promise<void> | void
   onTranscribeAudio?: (audio: Blob, owner?: ResolvedOwner) => Promise<string>
@@ -66,8 +71,8 @@ interface Conversation {
   warmup: Promise<void>
 }
 
-/** How long a barge-triggered interrupt may take to settle before we submit
- *  the captured utterance anyway. */
+/** How long a barge capture may wait for the running turn to settle before it
+ *  is submitted as the next turn anyway (steer-less fallback). */
 const INTERRUPT_SETTLE_TIMEOUT_MS = 5_000
 
 /** A take whose level meter died is sent to STT (the meter can't say whether
@@ -82,7 +87,7 @@ export function useVoiceConversation({
   busy,
   enabled,
   onFatalError,
-  onInterrupt,
+  onSteer,
   onStopWord,
   onSubmit,
   onTranscribeAudio,
@@ -129,18 +134,18 @@ export function useVoiceConversation({
   const statusRef = useRef<ConversationStatus>('idle')
   const wasEnabledRef = useRef(enabled)
   const onStopWordRef = useRef(onStopWord)
-  const onInterruptRef = useRef(onInterrupt)
+  const onSteerRef = useRef(onSteer)
   // `submitVoiceTurn` (the composer's real `onSubmit`) re-creates per render
   // and its busy guard captures THAT render's state; the barge monitor arms
   // once per turn, so `submitCapturedUtterance` can outlive the render that
   // created it and would otherwise hold that stale submit forever. Read the
-  // latest callback at call time, mirroring `onInterruptRef` (#123357).
+  // latest callback at call time, mirroring `onSteerRef` (#123357).
   const onSubmitRef = useRef(onSubmit)
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    onInterruptRef.current = onInterrupt
-  }, [onInterrupt])
+    onSteerRef.current = onSteer
+  }, [onSteer])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -540,8 +545,42 @@ export function useVoiceConversation({
           return
         }
 
-        // A generation-phase barge interrupted the in-flight turn; the submit
-        // path refuses while `busy`, so wait for the interrupt to settle.
+        // A generation-phase barge no longer interrupts the turn, so there is
+        // nothing to wait for: steer the running turn with the captured words.
+        // If a steer cannot carry them (the turn raced to its end, or no steer
+        // seam is wired), fall through to the submit-after-settle path below,
+        // which parks the transcript rather than dropping it (#123357).
+        if (busyRef.current && onSteerRef.current) {
+          let outcome: SteerOutcome = false
+
+          try {
+            outcome = await Promise.resolve(onSteerRef.current(transcript))
+          } catch {
+            outcome = false
+          }
+
+          if (!live()) {
+            return
+          }
+
+          if (outcome === 'steered') {
+            awaitingSpokenResponseRef.current = true
+            dropSpeechSession()
+            setStatus('thinking')
+
+            return
+          }
+
+          if (outcome === 'queued') {
+            resumeListening()
+
+            return
+          }
+        }
+
+        // The turn is still running and no steer carried the words (no seam
+        // wired): the submit path refuses while `busy`, so wait for the turn to
+        // settle before submitting them as the next one.
         const deadline = Date.now() + INTERRUPT_SETTLE_TIMEOUT_MS
 
         while (busyRef.current && Date.now() < deadline) {
@@ -587,9 +626,10 @@ export function useVoiceConversation({
    * Full-duplex barge-in monitor for the WHOLE agent turn: armed at submit,
    * live through generation (thinking) AND playback (speaking).
    *
-   * - generation phase (`busy`): speech interrupts the in-flight turn via
-   *   `onInterrupt` — the same seam as the Stop button — and cuts any TTS that
-   *   managed to start, so the stale reply never speaks.
+   * - generation phase (`busy`): speech cuts any TTS that managed to start and
+   *   the captured utterance STEERS the running turn — the same policy as the
+   *   text composer's `busy_input_mode: steer`. The turn is never interrupted;
+   *   if a steer cannot carry the words they queue as the next turn.
    * - playback phase: speech cuts playback and the captured interruption is
    *   transcribed and submitted as the next turn.
    *
@@ -620,11 +660,10 @@ export function useVoiceConversation({
         markVoicePlaybackInterrupted()
         stopVoicePlayback()
 
-        if (busyRef.current) {
-          // Mid-generation: stop the in-flight turn so the captured utterance
-          // becomes the next one instead of queueing behind a stale reply.
-          void onInterruptRef.current?.()
-        }
+        // Barge-in cuts the AUDIO only. The running turn is never interrupted:
+        // the captured utterance steers it once it is transcribed (see
+        // `submitCapturedUtterance`), which is what the text composer does with
+        // a correction typed mid-turn.
       },
       onUtterance: audio => {
         bargeCapturePendingRef.current = false

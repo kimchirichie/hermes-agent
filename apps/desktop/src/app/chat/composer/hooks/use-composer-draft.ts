@@ -1,5 +1,4 @@
 import { useAui, useAuiState, useComposerRuntime } from '@assistant-ui/react'
-import { SLASH_COMMAND_RE } from '@hermes/shared'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { isElementInHiddenPane } from '@/components/pane-shell/pane-visibility'
@@ -35,6 +34,7 @@ import { $composerPopout } from '@/store/composer-popout'
 import { migrateQueuedPrompts } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
 
+import { isSteerableTextValue } from '../busy-submit-state'
 import { type ComposerStoreWriter, createComposerStoreWriter } from '../composer-store-writer'
 import {
   cloneAttachments,
@@ -139,11 +139,7 @@ export function useComposerDraft({
   const hasText = useAuiState(s => s.composer.text.trim().length > 0)
   const isHelpHint = useAuiState(s => s.composer.text === '?')
 
-  const isSteerableText = useAuiState(s => {
-    const trimmed = s.composer.text.trim()
-
-    return trimmed.length > 0 && !SLASH_COMMAND_RE.test(trimmed)
-  })
+  const isSteerableText = useAuiState(s => isSteerableTextValue(s.composer.text))
 
   // assistant-ui's composer mutators throw when the core isn't bound yet (a
   // startup/thread-swap window); the DOM + draftRef hold the text and the

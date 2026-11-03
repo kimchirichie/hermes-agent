@@ -84,12 +84,12 @@ interface HookProps {
 
 function renderConversation(
   overrides: {
-    onInterrupt?: () => void
+    onSteer?: (text: string) => Promise<'queued' | 'steered' | false> | 'queued' | 'steered' | false
     pendingResponse?: () => { id: string; pending: boolean; text: string } | null
     transcript?: string
   } = {}
 ) {
-  const onInterrupt = overrides.onInterrupt ?? vi.fn()
+  const onSteer = overrides.onSteer
 
   // Mirrors the real app: submitting a turn makes the agent busy.
   const onBusyChange: { current: (busy: boolean) => void } = { current: () => undefined }
@@ -117,7 +117,7 @@ function renderConversation(
         busy,
         consumePendingResponse: vi.fn(),
         enabled: true,
-        onInterrupt,
+        onSteer,
         onStopWord,
         onSubmit,
         onTranscribeAudio,
@@ -128,7 +128,7 @@ function renderConversation(
 
   onBusyChange.current = busy => hook.rerender({ busy })
 
-  return { hook, onInterrupt, onBusyChange, onStopWord, onSubmit, onTranscribeAudio, reply }
+  return { hook, onSteer, onBusyChange, onStopWord, onSubmit, onTranscribeAudio, reply }
 }
 
 /** Drive the hook into the generation phase (turn submitted, model working). */
@@ -195,8 +195,9 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     }
   })
 
-  it('interrupts the in-flight turn when speech trips mid-generation', async () => {
-    const { hook, onInterrupt } = renderConversation()
+  it('steers the in-flight turn when speech trips mid-generation — it never interrupts it', async () => {
+    const onSteer = vi.fn(async () => 'steered' as const)
+    const { hook } = renderConversation({ onSteer })
 
     await act(async () => {
       await hook.result.current.start()
@@ -204,16 +205,50 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     await enterThinking(hook)
     await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
 
+    const monitor = monitorCalls.at(-1)
+
     act(() => {
-      monitorCalls.at(-1)?.onSpeech()
+      monitor?.onSpeech()
     })
 
-    expect(onInterrupt).toHaveBeenCalledTimes(1)
+    // Barge-in cuts the audio only; the turn keeps running.
     expect(markVoicePlaybackInterrupted).toHaveBeenCalled()
     expect(stopVoicePlayback).toHaveBeenCalled()
+
+    await act(async () => {
+      monitor?.onUtterance?.(new Blob(['x'], { type: 'audio/webm' }))
+    })
+
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('and another thing'))
+    expect(hook.result.current.status).toBe('thinking')
   })
 
-  it('submits the captured interruption once the interrupt settles (busy clears)', async () => {
+  it('queues the barge capture instead of submitting it when the steer keeps it for later', async () => {
+    const onSteer = vi.fn(async () => 'queued' as const)
+    const { hook, onSubmit } = renderConversation({ onSteer, transcript: 'no, do it differently' })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+
+    const monitor = monitorCalls.at(-1)
+
+    act(() => {
+      monitor?.onSpeech()
+    })
+
+    await act(async () => {
+      monitor?.onUtterance?.(new Blob(['x'], { type: 'audio/webm' }))
+    })
+
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('no, do it differently'))
+    // Only the kickoff turn was submitted; the queued words are the composer's.
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+  })
+
+  it('submits the captured interruption once the turn settles (busy clears)', async () => {
     const { hook, onSubmit } = renderConversation({ transcript: 'no, do it differently' })
 
     await act(async () => {
@@ -238,8 +273,9 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('no, do it differently'))
   })
 
-  it('does not interrupt when speech trips during playback (turn already done)', async () => {
-    const { hook, onInterrupt } = renderConversation()
+  it('does not steer when speech trips during playback (turn already done)', async () => {
+    const onSteer = vi.fn(async () => 'steered' as const)
+    const { hook } = renderConversation({ onSteer })
 
     await act(async () => {
       await hook.result.current.start()
@@ -254,7 +290,7 @@ describe('useVoiceConversation full-duplex barge-in', () => {
       monitorCalls.at(-1)?.onSpeech()
     })
 
-    expect(onInterrupt).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
     expect(stopVoicePlayback).toHaveBeenCalled()
   })
 

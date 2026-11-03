@@ -25,6 +25,7 @@ import { isOnboardingChat } from '@/store/onboarding-session'
 import { answerParkedCard, skipParkedCards, yieldParkedCardsToMessage } from '@/store/parked-card-answers'
 import { hasBlockingPromptRequest } from '@/store/prompts'
 
+import { isSteerableTextValue, type SteerOutcome } from '../busy-submit-state'
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
 import { pathifyRefs } from '../path-refs'
@@ -549,29 +550,24 @@ export function useComposerSubmit({
     refocusAfterSend(editorHadFocus)
   }
 
-  // Redirect the live turn with a correction. The gateway either restarts the
-  // active model request with its displayed context or waits for the current
-  // tool boundary. If the turn already ended, queue the words instead.
-  const steerDraft = (mode: 'interrupt' | 'steer' = 'interrupt') => {
-    const text = draftRef.current.trim()
-    // The Steer action on a restored send: queued under its id like a busy Enter (see queueRetry).
-    const retry = attachments.length ? undefined : takeDraftRetry?.(draftRef.current, [])
+  /**
+   * Redirect the live turn with `text` that never passed through the draft —
+   * the voice steer seam, where the words were spoken. Same rules as the
+   * draft's Steer button (text-only, never a slash command) and the same
+   * refusal handling: a steer that cannot carry the words keeps them for the
+   * next turn, so nothing spoken is lost. Resolves with what happened, so the
+   * voice can tell the live model whether the correction reached the turn.
+   */
+  const steerText = (text: string, mode: 'interrupt' | 'steer' = 'steer'): Promise<SteerOutcome> => {
+    const trimmed = text.trim()
 
-    if (retry) {
-      queueRetry(retry)
-
-      return
-    }
-
-    // Guard on live editor state, not the render-lagged `canSteer`: a redirect
-    // fired on a fast Enter must not be dropped because state hasn't synced.
-    if (!onSteer || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text)) {
-      return
+    if (!onSteer || attachments.length > 0 || !isSteerableTextValue(trimmed)) {
+      return Promise.resolve(false)
     }
 
     // Freeze `@terminal:` chips the same way idle submit / queue enqueue do.
     // Steer used to forward the bare token only (#77078).
-    const frozen = freezeComposerTransportPayload(text)
+    const frozen = freezeComposerTransportPayload(trimmed)
 
     if (frozen.missingLabels.length > 0) {
       notify({
@@ -580,20 +576,17 @@ export function useComposerSubmit({
         message: translateNow('composer.terminalSelectionMissingBody')
       })
 
-      return
+      return Promise.resolve(false)
     }
-
-    triggerHaptic('submit')
-    clearDraft()
 
     const submittedScope = activeQueueSessionKeyRef.current
 
-    // The draft is already cleared, so a refused or failed redirect must keep
-    // the only copy (#68927): the canonical gateway queue when the server owns
-    // it, the local queue otherwise, or the composer itself when there is no
-    // queue yet (a new chat is busy before its first session exists). Keep the
-    // frozen transport for the queue; restoring to the composer keeps the chip
-    // form so the user can re-send it as-is.
+    // A refused or failed redirect must keep the only copy (#68927): the
+    // canonical gateway queue when the server owns it, the local queue
+    // otherwise, or the composer itself when there is no queue yet (a new chat
+    // is busy before its first session exists). Keep the frozen transport for
+    // the queue; restoring to the composer keeps the chip form so the user can
+    // re-send it as-is.
     const hasTerminalTransport = frozen.displayText !== frozen.transportText
     const canonical = serverOwnsComposerQueue(sessionId ?? activeQueueSessionKey)
 
@@ -618,14 +611,47 @@ export function useComposerSubmit({
       }
     }
 
-    void Promise.resolve()
+    return Promise.resolve()
       .then(() => onSteer(frozen.transportText, mode))
-      .then(accepted => {
-        if (!accepted) {
-          keep()
+      .then((accepted): SteerOutcome => {
+        if (accepted) {
+          return 'steered'
         }
+
+        keep()
+
+        return 'queued'
       })
-      .catch(keep)
+      .catch((): SteerOutcome => {
+        keep()
+
+        return 'queued'
+      })
+  }
+
+  // Redirect the live turn with a correction. The gateway either restarts the
+  // active model request with its displayed context or waits for the current
+  // tool boundary. If the turn already ended, queue the words instead.
+  const steerDraft = (mode: 'interrupt' | 'steer' = 'interrupt') => {
+    const text = draftRef.current.trim()
+    // The Steer action on a restored send: queued under its id like a busy Enter (see queueRetry).
+    const retry = attachments.length ? undefined : takeDraftRetry?.(draftRef.current, [])
+
+    if (retry) {
+      queueRetry(retry)
+
+      return
+    }
+
+    // Guard on live editor state, not the render-lagged `canSteer`: a redirect
+    // fired on a fast Enter must not be dropped because state hasn't synced.
+    if (!onSteer || !text || attachments.length > 0 || !isSteerableTextValue(text)) {
+      return
+    }
+
+    triggerHaptic('submit')
+    clearDraft()
+    void steerText(text, mode)
   }
 
   const queueDraft = () => {
@@ -645,5 +671,5 @@ export function useComposerSubmit({
     refocusAfterSend(editorHadFocus)
   }
 
-  return { dispatchSubmit, queueDraft, steerDraft, submitDraft }
+  return { dispatchSubmit, queueDraft, steerDraft, steerText, submitDraft }
 }

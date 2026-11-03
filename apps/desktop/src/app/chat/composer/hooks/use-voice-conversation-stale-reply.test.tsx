@@ -97,7 +97,6 @@ describe('useVoiceConversation stale reply on next turn', () => {
           busy,
           consumePendingResponse,
           enabled: true,
-          onInterrupt: vi.fn(),
           onStopWord: vi.fn(),
           onSubmit,
           onTranscribeAudio: vi.fn(async () => 'what should we do today'),

@@ -1253,3 +1253,72 @@ describe('useComposerSubmit on an insecure origin (plain-HTTP LAN: no crypto.ran
     expect(stashAt).toHaveBeenCalledWith('stored-session', 'keep these words', [attachment])
   })
 })
+
+// The voice engine has no draft to steer: the words were spoken, so the live
+// hook hands them straight to `steerText`. Same rules as the Steer button, and
+// a refusal keeps the words for the next turn instead of dropping them.
+describe('useComposerSubmit voice steer seam', () => {
+  afterEach(() => {
+    cleanup()
+    clearQueuedPrompts('stored-session')
+    vi.restoreAllMocks()
+  })
+
+  it('steers spoken words into the running turn and reports it as steered', async () => {
+    const { clearDraft, hook, onSteer, onSubmit } = renderSubmitHook({ busy: true })
+
+    let outcome: 'queued' | 'steered' | false = false
+
+    await act(async () => {
+      outcome = await hook.result.current.steerText('skip the archive step')
+    })
+
+    expect(outcome).toBe('steered')
+    expect(onSteer).toHaveBeenCalledWith('skip the archive step', 'steer')
+    // Nothing was typed, so there is no draft to clear and no second turn.
+    expect(clearDraft).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('queues spoken words when the steer refuses them (the turn already ended)', async () => {
+    const { hook, onSteer, onSubmit } = renderSubmitHook({ busy: true })
+    onSteer.mockResolvedValue(false)
+
+    let outcome: 'queued' | 'steered' | false = false
+
+    await act(async () => {
+      outcome = await hook.result.current.steerText('skip the archive step')
+    })
+
+    expect(outcome).toBe('queued')
+    expect(getQueuedPrompts('stored-session').map(({ text }) => text)).toEqual(['skip the archive step'])
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('keeps spoken words in the queue when the steer throws', async () => {
+    const { hook, onSteer } = renderSubmitHook({ busy: true })
+    onSteer.mockRejectedValue(new Error('correction unsupported'))
+
+    let outcome: 'queued' | 'steered' | false = false
+
+    await act(async () => {
+      outcome = await hook.result.current.steerText('skip the archive step')
+    })
+
+    expect(outcome).toBe('queued')
+    expect(getQueuedPrompts('stored-session').map(({ text }) => text)).toEqual(['skip the archive step'])
+  })
+
+  it('refuses a slash command instead of steering it (those execute inline)', async () => {
+    const { hook, onSteer } = renderSubmitHook({ busy: true })
+
+    let outcome: 'queued' | 'steered' | false = 'queued'
+
+    await act(async () => {
+      outcome = await hook.result.current.steerText('/clear')
+    })
+
+    expect(outcome).toBe(false)
+    expect(onSteer).not.toHaveBeenCalled()
+  })
+})

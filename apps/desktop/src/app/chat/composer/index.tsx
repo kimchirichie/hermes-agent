@@ -426,7 +426,7 @@ export function ChatBar({
 
   // The submit engine — the orchestration seam where draft + queue meet. Owns
   // the submit decision tree, the send-with-restore primitive, and steer.
-  const { queueDraft, steerDraft, submitDraft } = useComposerSubmit({
+  const { queueDraft, steerDraft, steerText, submitDraft } = useComposerSubmit({
     busyInputMode,
     activeQueueSessionKey,
     activeQueueSessionKeyRef,
@@ -1099,9 +1099,11 @@ export function ChatBar({
     focusInput,
     insertText,
     maxRecordingSeconds,
-    // Voice barge-in mid-generation halts the run like the Stop button.
-    onInterrupt: haltRun,
     onSubmit,
+    // Spoken words mid-turn steer the running turn instead of halting it —
+    // the same policy as the text composer (`busy_input_mode: steer`). A
+    // steer that cannot carry them queues them as the next turn.
+    onSteer: text => steerText(text, 'steer'),
     onTranscribeAudio,
     sessionId,
     target: scope.target
