@@ -226,7 +226,7 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
     note = owner_attempt_note(conn, task_id, lost)
-    if owner_interrupted_attempt(conn, task_id, lost=lost):
+    if owner_interrupted_attempt(conn, task_id, lost=lost, exit_code=dead.code):
         dead.interrupted = True
         dead.event_kind = "interrupted"
         dead.protocol_violation = False
@@ -252,32 +252,44 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     dead.error_text = f"{head} [{note}]{sep}{output}"
 
 
-def owner_interrupted_attempt(conn, task_id, *, lost=None) -> bool:
+def owner_interrupted_attempt(conn, task_id, *, lost=None, exit_code=None) -> bool:
     """True when the attempt died WITH its owner instead of failing on its own work.
 
-    Two owner-side proofs, both durable in the board:
+    Owner-side proofs, all durable in the board, checked strongest first:
 
-      * the owner settled the admission ``interrupted`` — it was torn down mid-attempt and lost
-        the worker with it;
       * the owner process named by the receipt is gone, or its pid number now belongs to another
-        process (the gateway died: SIGKILL, OOM, launchd teardown, a restart that did not park).
+        process (the gateway died: SIGKILL, OOM, launchd teardown, a restart that did not park);
+      * the worker recorded the interrupted exit (130): its own turn was stopped, which only a
+        stop from the owner produces;
+      * the owner settled the admission ``interrupted`` AND the worker named no failing exit
+        (never reported one, or exited 0). The settlement alone is NOT attribution: the owner
+        writes ``interrupted`` for any attempt whose turn ends without a result, and a worker
+        that died on its own work takes the owner's turn down with it, so it settles exactly the
+        same way. Reading that settlement as "the owner died" booked such attempts
+        ``interrupted``, which never charges ``consecutive_failures`` — the same card was then
+        respawned on every dispatcher tick, forever, while ``crashed=0`` hid it.
 
-    A worker that crashed while its owner kept running is NOT this: the owner is alive, so the run
-    keeps its ``crashed`` booking and the retry budget it deserves. Called from the reclaim path,
-    which is the only place a death of unknown cause is booked.
+    All three still need an owner record (``worker_lost`` or a settled admission): a dead pid
+    alone is not attribution. A worker that died under a still-live owner on its own non-zero
+    exit is NOT this — it keeps its ``crashed`` booking and the retry budget it deserves. Called
+    from the reclaim path, where a death of unknown cause is booked.
     """
+    from hermes_cli.turn_exit import INTERRUPTED_EXIT_CODE
     receipt = _owner_receipt(conn, task_id)
     if receipt is None:
         return False
     admission = _admission_row(receipt)
-    if admission is not None and admission[0] == 'terminal' and admission[1] == 'interrupted':
-        return True
+    settled = admission is not None and admission[0] == 'terminal' and admission[1] == 'interrupted'
     if lost is None:
         lost = _latest_run_event(conn, task_id, 'worker_lost')
-    if not lost:
-        # No owner record that the worker was lost: an ordinary dead worker, not an owner death.
+    if not settled and not lost:
+        # No owner record of the attempt: an ordinary dead worker, not an owner death.
         return False
-    return _owner_process_gone(receipt)
+    if _owner_process_gone(receipt):
+        return True
+    if exit_code is not None and int(exit_code) == INTERRUPTED_EXIT_CODE:
+        return True
+    return settled and (exit_code is None or int(exit_code) == 0)
 
 
 def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
