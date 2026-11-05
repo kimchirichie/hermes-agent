@@ -239,11 +239,13 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked or res.stale
+            or getattr(res, "interrupted", None)
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] reclaimed={res.reclaimed} "
-                f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} stale={len(res.stale)} "
+                f"crashed={len(res.crashed)} interrupted={len(getattr(res, 'interrupted', []) or [])} "
+                f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
                 f"auto_blocked={len(res.auto_blocked)}",
                 flush=True,
