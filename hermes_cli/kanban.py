@@ -626,6 +626,33 @@ def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
     return by
 
 
+def _cmd_claim_check(args: argparse.Namespace) -> int:
+    """Step 0 preflight: is this subject already in flight on another card or an open PR?
+
+    Exit 3 when claimed, so a shell preflight can gate on it (`... claim-check t_x || exit 0`),
+    0 when clear, 2 when the check itself could not run.
+    """
+    from hermes_cli.kanban_claims import claim_check
+
+    try:
+        with kbc.connect_closing() as conn:
+            if args.task_id and kb.get_task(conn, args.task_id) is None:
+                return _err(f"no such task: {args.task_id}")
+            payload = claim_check(
+                conn, task_id=args.task_id, repo=args.repo, branch=args.branch,
+                files=args.files or [], check_github=not args.no_github,
+                role=getattr(args, "role", None))
+    except Exception as exc:  # a broken preflight must not look like a clear board
+        return _err(f"claim check failed: {exc}")
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        gh = payload.get("github") or {}
+        reach = ("github " + gh.get("note", "skipped")) if gh else "github skipped"
+        print(f"{payload['verdict']}: {payload['reason']}  [{reach}]")
+    return 3 if payload["verdict"] == "claimed" else 0   # "overlapping" is a signal, not a stop
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -1323,6 +1350,7 @@ _HANDLERS = {
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+    "claim-check": _cmd_claim_check,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,

@@ -271,6 +271,17 @@ _SPECS = [
         _arg("--task", help="Only show diagnostics for one task id"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
+    _cmd("claim-check", [
+        _arg("task_id", nargs="?", help="Task whose title/body/branch name the subject to check"),
+        _arg("--repo", help="owner/repo to ask GitHub (default: a github.com URL on the card)"),
+        _arg("--branch", help="Branch to check (default: taken from the card)"),
+        _arg("--file", action="append", dest="files", default=[],
+             help="File path to check; repeatable (default: taken from the card)"),
+        _arg("--role", choices=["build", "review", "ship"],
+             help="Lane to compare against (default: from the task, else 'build')"),
+        _arg("--no-github", action="store_true", help="Consult the board only; never call gh"),
+        _json_flag(help="Emit JSON instead of a one-line verdict"),
+    ], help="Step 0 preflight: is this subject already in flight on another card or an open PR?"),
     _cmd("link", [_arg("parent_id"), _arg("child_id")], help="Add a parent->child dependency"),
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
     _cmd("claim", [

@@ -325,6 +325,13 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 
+def _claim_dedupe_enabled() -> bool:
+    """Cross-card claim dedupe (``kanban.claim_dedupe`` / ``HERMES_KANBAN_CLAIM_DEDUPE``)."""
+    from hermes_cli.kanban_claims import dedupe_enabled
+
+    return dedupe_enabled()
+
+
 # --- Paths ---
 
 DEFAULT_BOARD = "default"
@@ -1235,6 +1242,31 @@ def create_task(
 
     now = int(time.time())
 
+    # One change, one lane (2026-11-05: one gate.yml edit became six cards and three PRs).
+    # A lane's sandbox cannot see another lane's unmerged branch, so the subject is judged here,
+    # from the board: if an open card in this card's lane already holds the same branch or file,
+    # the existing card becomes a parent. Nothing is refused and no work is lost — the card
+    # waits in todo, auto-promotes when the holder finishes, and says why meanwhile. A filer who
+    # means it passes the parent itself, or writes ``overlap: allowed`` for a parallel fix in the
+    # same file; a shared branch is never excused.
+    claim_gate: Optional[dict] = None
+    if _claim_dedupe_enabled():
+        try:
+            from hermes_cli import kanban_claims as _claims
+
+            claims = _claims.extract_claims(title, body, branch_name=branch_name)
+            conflicts = _claims.find_conflicts(
+                conn, claims, _claims.card_role(assignee, title),
+                already_gated_by=parents,
+                allow_file_overlap=_claims.overlaps_allowed(body),
+            )
+            if conflicts:
+                holders = tuple(dict.fromkeys(c.task_id for c in conflicts))[:3]
+                parents = tuple(dict.fromkeys((*parents, *holders)))
+                claim_gate = {"reason": _claims.reason_line(conflicts), "holders": list(holders)}
+        except Exception:  # a claim bug must never block the board
+            _log.debug("claim dedupe skipped for %r", title, exc_info=True)
+
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
     if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
@@ -1302,6 +1334,8 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if claim_gate:
+                    _append_event(conn, task_id, "claim_conflict", claim_gate)
                 if task_status == "blocked":
                     _append_event(
                         conn,

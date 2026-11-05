@@ -22,7 +22,7 @@ from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+    KANBAN_CLAIM_CHECK_SCHEMA, KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
@@ -1150,8 +1150,29 @@ def _handle_create(args: dict, **kw) -> str:
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        claim_hits = [e for e in kb.list_events(conn, new_tid) if e.kind == "claim_conflict"]
+        if claim_hits:
+            gate["claim_conflict"] = claim_hits[-1].payload
         return _ok(task_id=new_tid, **landed, **gate,
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
+
+
+@_kanban_handler("kanban_claim_check")
+def _handle_claim_check(args: dict, **kw) -> str:
+    """Step 0: does another card, or an open PR, already hold this task's subject?"""
+    from hermes_cli.kanban_claims import claim_check as _claim_check
+
+    tid = _default_task_id(args.get("task_id"))
+    files = _coerce_str_list(args.get("files") or [], "files", "file paths")
+    check_github = _parse_bool_arg(args, "check_github") if "check_github" in args else True
+    with _board(args.get("board")) as (kb, conn):
+        if tid:
+            _existing_task(kb, conn, tid)
+        payload = _claim_check(
+            conn, task_id=tid, repo=(str(args.get("repo")).strip() or None) if args.get("repo") else None,
+            branch=(str(args.get("branch")).strip() or None) if args.get("branch") else None,
+            files=files, check_github=check_github)
+    return _ok(**payload)
 
 
 def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
@@ -1306,6 +1327,7 @@ _TOOLS = (
     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
+    ("kanban_claim_check", KANBAN_CLAIM_CHECK_SCHEMA, _handle_claim_check, "🔎"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
