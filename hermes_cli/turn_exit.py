@@ -12,6 +12,10 @@ TERMINAL_PROVIDER_REASONS = frozenset({
     "auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked",
 })
 
+# A kanban worker whose own turn was stopped (SIGINT semantics, 128+2). Distinct from any exit a
+# worker produces by failing, so the board can tell an owner's Stop from the card's own fault.
+INTERRUPTED_EXIT_CODE = 130
+
 
 def turn_exit_code(
     result, *, kanban_worker: bool, credentials_rate_limited: bool = False,
@@ -28,7 +32,7 @@ def turn_exit_code(
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
         return 1
     if result.get("interrupted"):
-        return 130
+        return INTERRUPTED_EXIT_CODE
     if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
         return 0
     if kanban_worker:

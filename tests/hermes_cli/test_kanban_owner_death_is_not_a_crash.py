@@ -65,9 +65,13 @@ class _Board:
     def dead_attempt(
         self, tid: str = "t_ghost", *, worker_pid=None, owner_pid=None,
         admission=("terminal", "interrupted"), worker_lost: str | None = "EOFError",
-        status: str = "running", failures: int = 0, max_retries=None,
+        status: str = "running", failures: int = 0, max_retries=None, worker_exit: int | None = None,
     ) -> int:
-        """A ``running`` card whose worker died under the named owner."""
+        """A ``running`` card whose worker died under the named owner.
+
+        *worker_exit* writes the attempt's own ``worker_result`` (the managed worker records it
+        before it dies); None leaves the attempt with no exit of its own.
+        """
         worker_pid = _absent_pid() if worker_pid is None else worker_pid
         owner_pid = _absent_pid(base=3_600_000) if owner_pid is None else owner_pid
         lock = f"{HOST}:{owner_pid}"
@@ -93,6 +97,10 @@ class _Board:
                     "pid": owner_pid}, started + 30)
         if worker_lost:
             self.event(tid, run, "worker_lost", {"pid": worker_pid, "reason": worker_lost}, NOW - 40)
+        if worker_exit is not None:
+            self.event(tid, run, "worker_result",
+                       {"pid": worker_pid, "claim_lock": lock, "exit_code": worker_exit,
+                        "last_output": ""}, NOW - 45)
         if admission:
             with sqlite3.connect(self.ledger) as store:
                 store.execute("INSERT INTO session_admissions VALUES ('sess-1', ?, ?, ?)",
@@ -172,6 +180,34 @@ def test_no_worker_lost_record_means_no_owner_attribution(board):
     board.dead_attempt("t_no_evidence", owner_pid=_absent_pid(base=3_700_000),
                        admission=None, worker_lost=None)
     assert owner_interrupted_attempt(board.conn, "t_no_evidence") is False
+
+
+def test_a_self_failing_worker_under_a_live_owner_books_crashed_not_interrupted(board):
+    """The owner settles its own attempt ``interrupted`` when its worker dies mid-turn — including
+    a worker that failed on its OWN work (a startup ValueError takes the owner's turn with it).
+    That settlement must not excuse the card, or a card that fails the same way every tick is
+    respawned forever with ``crashed=0``: it never charges ``consecutive_failures``."""
+    board.dead_attempt("t_skills_missing", owner_pid=os.getpid(),
+                       admission=("terminal", "interrupted"), worker_exit=1, max_retries=1)
+    assert owner_interrupted_attempt(board.conn, "t_skills_missing", exit_code=1) is False
+
+    assert kbd.detect_crashed_workers(board.conn, board="default") == ["t_skills_missing"]
+    row, run = board.state("t_skills_missing"), board.run_row("t_skills_missing")
+    assert (run["status"], run["outcome"]) == ("crashed", "crashed")
+    assert row["consecutive_failures"] == 1          # the retry budget it deserves
+    assert row["status"] == "blocked"                # ...and the breaker ends the loop
+
+
+def test_a_worker_stopped_by_its_owner_books_interrupted(board):
+    """Exit 130 is the interrupted-turn exit: only a stop from the owner produces it."""
+    board.dead_attempt("t_stopped", owner_pid=os.getpid(),
+                       admission=("terminal", "interrupted"), worker_exit=130, failures=2)
+    assert owner_interrupted_attempt(board.conn, "t_stopped", exit_code=130) is True
+
+    assert kbd.detect_crashed_workers(board.conn, board="default") == []
+    row = board.state("t_stopped")
+    assert (row["status"], row["consecutive_failures"]) == ("ready", 2)
+    assert board.run_row("t_stopped")["outcome"] == "interrupted"
 
 
 # --- shutdown path: park before the workers are killed -------------------------------------
