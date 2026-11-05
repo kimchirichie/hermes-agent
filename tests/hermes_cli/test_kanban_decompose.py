@@ -250,3 +250,48 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+
+
+def test_decompose_never_calls_the_aux_llm_for_an_already_decomposed_task(kanban_home):
+    """A triage card that already carries a ``decomposed`` event can never fan
+    out again, so the aux LLM call is pure waste — and the gateway tick paid it
+    for every such corpse, every tick, forever (t_19ae1f07 / t_a52af2ba)."""
+    from hermes_cli.kanban_db_graph import decompose_triage_task
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale install prep", triage=True)
+    with kbc.connect() as conn:
+        assert decompose_triage_task(
+            conn, tid, root_assignee="worker",
+            children=[{"title": "child one"}], author="test",
+        ) is not None
+        # Back in triage, exactly like the real corpses: promoted again after
+        # the graph was committed.
+        conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+
+    calls = []
+    with patch("hermes_cli.kanban_decompose._call_aux",
+               side_effect=lambda *a, **k: calls.append(a) or (None, "must not be called")):
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert calls == [], "aux LLM was called for a task that cannot decompose"
+    assert outcome.ok is False
+    assert outcome.reason == decomp._ALREADY_DECOMPOSED
+
+
+def test_list_triage_ids_hides_already_decomposed_corpses(kanban_home):
+    """The tick's per-tick cap must not be spent on cards it cannot act on."""
+    from hermes_cli.kanban_db_graph import decompose_triage_task
+
+    with kbc.connect() as conn:
+        live = kb.create_task(conn, title="a real triage card", triage=True)
+        corpse = kb.create_task(conn, title="decomposed then re-triaged", triage=True)
+    with kbc.connect() as conn:
+        decompose_triage_task(
+            conn, corpse, root_assignee="worker",
+            children=[{"title": "child one"}], author="test",
+        )
+        conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (corpse,))
+
+    assert decomp.list_triage_ids() == [live]
+    assert sorted(decomp.list_triage_ids(include_decomposed=True)) == sorted([live, corpse])

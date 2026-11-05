@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_db_graph import decompose_triage_task
+from hermes_cli.kanban_db_graph import decompose_triage_task, has_decomposed_event
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
@@ -107,6 +107,10 @@ Default assignee (used when no profile fits a task): {default_assignee}
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+# One wording for "the graph is already committed / the root is no longer
+# triage", whether it is caught before the aux call or at fan-out time.
+_ALREADY_DECOMPOSED = "task already decomposed or moved out of triage"
 
 
 @dataclass
@@ -298,7 +302,7 @@ def _apply_fanout(
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
-        return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
+        return DecomposeOutcome(task_id, False, _ALREADY_DECOMPOSED)
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
     )
@@ -323,6 +327,15 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
+    # Cheap no-op guard BEFORE the aux call: a task that already has a
+    # ``decomposed`` event can never fan out again (``decompose_triage_task``
+    # rejects it), so asking the LLM about it buys a guaranteed rejection.
+    # Without this the gateway tick paid an aux call per stuck triage card,
+    # every tick, forever.
+    with kbc.connect_closing(board=board) as conn:
+        if has_decomposed_event(conn, task_id):
+            return DecomposeOutcome(task_id, False, _ALREADY_DECOMPOSED)
+
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
@@ -346,8 +359,19 @@ def decompose_task(
     return _apply_fanout(task_id, parsed, routing, audit_author, board=board)
 
 
-def list_triage_ids(*, tenant: Optional[str] = None, board: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column of ``board`` (default: ambient)."""
+def list_triage_ids(
+    *, tenant: Optional[str] = None, board: Optional[str] = None, include_decomposed: bool = False,
+) -> list[str]:
+    """Return task ids currently in the triage column of ``board`` (default: ambient).
+
+    Tasks that already carry a ``decomposed`` event are omitted unless
+    ``include_decomposed=True``: they can never fan out again, so a caller that
+    spends an aux LLM call (or a per-tick cap slot) per id must not see them.
+    Their card stays where it is — the decomposer just stops paying for it.
+    """
     with kbc.connect_closing(board=board) as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        ids = [row.id for row in rows]
+        if include_decomposed:
+            return ids
+        return [tid for tid in ids if not has_decomposed_event(conn, tid)]
