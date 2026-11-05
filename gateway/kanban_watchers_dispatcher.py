@@ -252,6 +252,15 @@ class _KanbanDispatcher:
 
         Runs before dispatch fans out; the per-tick cap keeps a bulk triage
         load from burst-spending the aux LLM. Returns the number decomposed.
+
+        Every board is named EXPLICITLY (``board=slug``) and nothing is written
+        to ``os.environ``: this tick shares the gateway process with every live
+        session, and ``os.environ`` is process-wide, not thread-local. Pinning
+        it here (as this used to) leaked the decomposer's board into any
+        concurrent turn for as long as the aux LLM call lasts — up to its 180s
+        timeout — so a boardless ``kanban_create`` in a chat session resolved
+        the ENV pin before the ``current`` file and filed on whichever board the
+        decomposer was working on (three misroutes: didi, didi, personal).
         """
         try:
             from hermes_cli import kanban_decompose as _decomp
@@ -265,33 +274,23 @@ class _KanbanDispatcher:
             for slug in self._board_slugs():
                 if attempted >= auto_decompose_per_tick:
                     break
-                # Pin the board via env for the call: the decomposer connects
-                # with no board kwarg (same pattern as the dashboard specify endpoint).
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
                 try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
-                    try:
-                        triage_ids = _decomp.list_triage_ids()
-                    except Exception as exc:
-                        logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
-                        triage_ids = []
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        attempted += 1
-                        successes += self._decompose_one(_decomp, slug, tid)
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
+                    triage_ids = _decomp.list_triage_ids(board=slug)
+                except Exception as exc:
+                    logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
+                    triage_ids = []
+                for tid in triage_ids:
+                    if attempted >= auto_decompose_per_tick:
+                        break
+                    attempted += 1
+                    successes += self._decompose_one(_decomp, slug, tid)
         return successes
 
     @staticmethod
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
         """Decompose one triage task; returns 1 on success, 0 otherwise."""
         try:
-            outcome = _decomp.decompose_task(tid, author="auto-decomposer")
+            outcome = _decomp.decompose_task(tid, author="auto-decomposer", board=slug)
         except Exception:
             logger.exception("kanban auto-decompose: decompose_task crashed on %s", tid)
             return 0
