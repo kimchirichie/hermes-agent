@@ -285,6 +285,12 @@ def owner_interrupted_attempt(conn, task_id, *, lost=None, exit_code=None) -> bo
     if not settled and not lost:
         # No owner record of the attempt: an ordinary dead worker, not an owner death.
         return False
+    if exit_code is not None and int(exit_code) not in (0, INTERRUPTED_EXIT_CODE):
+        # The attempt recorded a failing exit of its own. That is the card's own verdict, and it
+        # outranks a dead owner: a gateway that restarts between the failure and the reclaim must
+        # not launder a card that keeps failing on its own configuration into "interrupted", which
+        # never charges ``consecutive_failures`` and so loops the card every tick forever.
+        return False
     if _owner_process_gone(receipt):
         return True
     if exit_code is not None and int(exit_code) == INTERRUPTED_EXIT_CODE:
@@ -332,6 +338,22 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
     the dispatcher's own worker, or the owner-side interpreter ``worker_bound`` recorded under
     that claim — ``session_kanban._record_worker_result`` writes the interpreter's pid, never the
     spawned submitter's ``tasks.worker_pid``."""
+    return _managed_run_result(conn, task_id, worker_pid, claim_lock).get("exit_code")
+
+
+def managed_run_preflight(conn, task_id, worker_pid, claim_lock) -> bool:
+    """True when this run's own result says it died BEFORE its first turn.
+
+    Same authority rule as :func:`managed_run_exit_code`: the attempt's ``worker_result`` under
+    this claim, from a pid of this run. The worker sets it only when the exception was raised in
+    skill resolution, prompt assembly or agent construction — no model call, no tool call — so
+    the same input reproduces the same fault on every retry.
+    """
+    return bool(_managed_run_result(conn, task_id, worker_pid, claim_lock).get("preflight"))
+
+
+def _managed_run_result(conn, task_id, worker_pid, claim_lock) -> dict:
+    """The current run's ``worker_result`` payload when it speaks for this claim, else ``{}``."""
     def latest(kind):
         row = conn.execute(
             "SELECT e.payload FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
@@ -344,4 +366,4 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
 
     result, bound = latest('worker_result'), latest('worker_bound')
     pids = {worker_pid, *([bound.get('pid')] if bound.get('claim_lock') == claim_lock else [])}
-    return result.get('exit_code') if result.get('claim_lock') == claim_lock and result.get('pid') in pids else None
+    return result if result.get('claim_lock') == claim_lock and result.get('pid') in pids else {}
