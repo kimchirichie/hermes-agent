@@ -383,6 +383,36 @@ KANBAN_ATTACHMENTS_SCHEMA = _schema(
     [],
 )
 
+KANBAN_CLAIM_CHECK_SCHEMA = _schema(
+    "kanban_claim_check",
+    (
+        "Step 0 before you build anything: is another card, or an open PR, already holding this "
+        "task's branch or files? Judges the subject from shared state — the board plus GitHub's "
+        "open PRs — never from your workspace, because a lane cannot see another lane's unmerged "
+        "branch. ``verdict='claimed'`` means the work is already in flight: do NOT build a second "
+        "copy; call ``kanban_block(kind='dependency', reason=...)`` with the one-line reason and "
+        "stop. ``verdict='overlapping'`` means an open PR on a *different* branch touches a file "
+        "you claimed — read it before building, but it is not a stop. ``clear`` proceeds."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "repo": _prop("string", (
+                "owner/repo to ask GitHub about. Defaults to a github.com URL or a "
+                "`repo: owner/name` line on the card; without one GitHub is skipped and only "
+                "the board is consulted."
+        )),
+        "branch": _prop("string", "Branch to check, when the card does not name one."),
+        "files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "File paths to check, when the card does not name them.",
+        },
+        "check_github": _prop("boolean", (
+                "Set false to consult only the board (no `gh` call). Defaults to true.")),
+    },
+    [],
+)
+
 KANBAN_CREATE_SCHEMA = _schema(
     "kanban_create",
     (
@@ -390,7 +420,13 @@ KANBAN_CREATE_SCHEMA = _schema(
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles. "
+        "**Dedupe:** if another open card in the same lane (build/review/ship) already holds this "
+        "card's branch or a file it names, that card is added as a parent automatically and the "
+        "new card waits in todo — the response carries ``claim_conflict`` naming the holder. Pass "
+        "``parents=[holder]`` yourself to say so deliberately, or write a line ``overlap: allowed`` "
+        "in the body for a genuinely independent second change to the same file. A shared branch "
+        "is never excused."
     ),
     {
         "title": _prop("string", "Short task title (required)."),
