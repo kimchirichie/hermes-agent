@@ -394,10 +394,12 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         tid = kb.create_task(conn, title="park", assignee="worker")
         kb.claim_task(conn, tid)
         kb.request_review(
-            conn, tid, summary="done",
+            conn, tid, summary="done", reviewer="reviewer",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "review"
+        parked = kb.get_task(conn, tid)
+        assert parked is not None and parked.assignee == "reviewer"
 
         # The assignee profile is spawnable — so ONLY the gate can stop the
         # review-column dispatch from claiming it.
@@ -420,6 +422,88 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         )
         res_on = kbd.dispatch_once(conn, dry_run=True)
         assert tid in [s[0] for s in res_on.spawned]
+
+
+def test_review_lane_leaves_a_human_review_gate_alone(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A handoff that names no reviewer is a HUMAN gate, not a self-review.
+
+    t_147a3b91 delivered its mockups, requested review without a reviewer, and the
+    review lane re-claimed the card for the implementer: that spawn forces
+    ``sdlc-review`` onto a profile that cannot load it, dies before its first turn,
+    and books the delivered card as crashed twice until the retry budget is gone.
+    The card must instead stay parked in ``review`` for the person it was handed to,
+    and the same card handed to a NAMED reviewer must still dispatch.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    with kbc.connect() as conn:
+        human_id = kb.create_task(conn, title="photos for Rick", assignee="mockup")
+        human_run = kb.claim_task(conn, human_id)
+        assert human_run is not None
+        assert kb.request_review(
+            conn, human_id, summary="mockups rendered",
+            expected_run_id=human_run.current_run_id,
+        )
+        named_id = kb.create_task(conn, title="PR review", assignee="worker")
+        named_run = kb.claim_task(conn, named_id)
+        assert named_run is not None
+        assert kb.request_review(
+            conn, named_id, summary="PR ready", reviewer="reviewer",
+            expected_run_id=named_run.current_run_id,
+        )
+
+        assert kb.review_awaits_human(conn, human_id) is True
+        assert kb.review_awaits_human(conn, named_id) is False
+        before = conn.execute(
+            "SELECT count(*) FROM task_runs WHERE task_id = ?", (human_id,)).fetchone()[0]
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        spawned_ids = [s[0] for s in res.spawned]
+
+        assert human_id not in spawned_ids
+        assert named_id in spawned_ids
+        # Parked, untouched: no claim, no extra run, still the implementer's card.
+        parked = kb.get_task(conn, human_id)
+        assert parked is not None and parked.status == "review"
+        assert parked.claim_lock is None and parked.assignee == "mockup"
+        after = conn.execute(
+            "SELECT count(*) FROM task_runs WHERE task_id = ?", (human_id,)).fetchone()[0]
+        assert after == before
+
+
+def test_review_lane_dispatch_skips_self_handoff_even_with_claim(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate is a pre-claim skip: a real (non-dry) tick spawns nothing for it."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    spawns: list[str] = []
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="mockups", assignee="mockup")
+        run = kb.claim_task(conn, tid)
+        assert run is not None
+        assert kb.request_review(
+            conn, tid, summary="done", expected_run_id=run.current_run_id)
+        res = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace: spawns.append(task.id))
+
+    assert spawns == []
+    assert tid not in [s[0] for s in res.spawned]
 
 
 def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
@@ -450,7 +534,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert claimed is not None
         kb.add_comment(conn, review_id, author="worker", body=pr_comment)
         assert kb.request_review(
-            conn, review_id, summary="PR ready",
+            conn, review_id, summary="PR ready", reviewer="reviewer",
             expected_run_id=claimed.current_run_id,
         )
         # Ready-lane task with the same fresh PR comment.
@@ -663,6 +747,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             conn,
             task_id,
             summary="ready",
+            reviewer="reviewer",
             expected_run_id=implementation.current_run_id,
         )
         monkeypatch.setattr(
@@ -712,6 +797,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
                 conn,
                 task_id,
                 summary="ready",
+                reviewer="reviewer",
                 expected_run_id=implementation.current_run_id,
             )
             review_ids.append(task_id)

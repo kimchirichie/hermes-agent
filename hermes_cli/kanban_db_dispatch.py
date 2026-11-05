@@ -1059,21 +1059,55 @@ class _DeadWorker:
 
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
-    board: Optional[str] = None,
+    board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None,
+    run_id: Optional[int] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
     A clean exit or a crash carries the worker's own last output (``worker_output``
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+    The words must come from THIS attempt: ``conn``/``run_id`` name the run whose
+    ``worker_result`` event holds them, and only when that event is absent (a
+    pre-event worker) does the shared per-task log get quoted — its tail can be a
+    previous attempt's text, which once made a review-lane crash read as a skill
+    patch from the run before it.
     """
     dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
     if task_id and not dead.rate_limited:
-        worker_output = _worker_final_output(task_id, board=board)
+        worker_output = _run_worker_output(task_id, run_id, conn=conn, board=board)
         if worker_output:
             dead.error_text += f"{WORKER_OUTPUT_SEP}{worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
     return dead
+
+
+def _run_worker_output(
+    task_id: str, run_id: Optional[int], *, conn: Optional[sqlite3.Connection] = None,
+    board: Optional[str] = None,
+) -> str:
+    """One dead attempt's final words, quoted only when that attempt said them.
+
+    A managed worker records them on its own ``worker_result`` event, so an empty
+    value there means the attempt said nothing — never fall back to the shared log
+    then, or a prior attempt's text gets quoted against this one.
+    """
+    if run_id is None:
+        return _worker_final_output(task_id, board=board)
+    sql = ("SELECT payload FROM task_events WHERE run_id = ? AND task_id = ? "
+           "AND kind = 'worker_result' ORDER BY id DESC LIMIT 1")
+    try:
+        if conn is not None:
+            row = conn.execute(sql, (int(run_id), task_id)).fetchone()
+        else:
+            uri = Path(_kb.kanban_db_path(board=board)).resolve().as_uri() + '?mode=ro'
+            with contextlib.closing(sqlite3.connect(uri, uri=True)) as own:
+                row = own.execute(sql, (int(run_id), task_id)).fetchone()
+    except (sqlite3.Error, OSError):
+        row = None
+    if row is None:
+        return _worker_final_output(task_id, board=board)
+    return _kb._lossy_text(_kb._json_dict(row[0]).get("last_output") or "")
 
 
 def _classify_dead_worker_exit(
@@ -1166,7 +1200,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1191,7 +1225,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             pid = int(row["worker_pid"])
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board,
+                                         conn=conn, run_id=_kb._row_get(row, "current_run_id"))
             apply_attempt_note(conn, row["id"], pid, dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
@@ -2390,6 +2425,21 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _review_lane_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Review-lane rows the dispatcher may claim: unclaimed ``review`` cards whose
+    handoff names a reviewer.
+
+    A handoff with no reviewer is a HUMAN review gate
+    (:func:`hermes_cli.kanban_db.review_awaits_human`): the card is still assigned to
+    its implementer, so claiming it would ask that profile to review its own work —
+    and a review lane forces ``sdlc-review`` onto the spawn, so a profile without that
+    skill dies before its first turn and spends the card's retry budget on a handoff
+    that had already delivered. Skipping the row here keeps the card parked in
+    ``review`` where the person it was handed to can act on it.
+    """
+    return [row for row in _lane_rows(conn, "review") if not _kb.review_awaits_human(conn, row["id"])]
+
+
 def _at_profile_cap(
     assignee: str,
     per_profile_cap: Optional[Callable[[str], Optional[int]]],
@@ -2484,7 +2534,7 @@ def _dispatch_once_locked(
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    review_rows = _review_lane_rows(conn) if review_dispatch_enabled() else []
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which

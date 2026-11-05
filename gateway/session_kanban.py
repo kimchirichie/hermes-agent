@@ -283,6 +283,10 @@ def _run_worker_turns(agent, frame, history):
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+        # The crash that ends this attempt is usually one line ("kanban_skills_unavailable").
+        # Record it as the attempt's last output: the reclaim books that text on the board,
+        # and without it the only trace was a traceback in the profile log.
+        last_output = f'{type(exc).__name__}: {exc}'[:500]
         raise
     finally:
         _record_worker_result(context, code, last_output)
