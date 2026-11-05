@@ -1819,6 +1819,44 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             GatewayShutdownMixin._stop_kill_tool_subprocesses, phase
         )
 
+    async def _stop_park_kanban_runs(self, ctx: GatewayShutdownMixin._StopContext) -> None:
+        """Park in-flight kanban runs as ``interrupted`` before their workers are killed.
+
+        Kanban workers are children of this process: the drain below does not count them (they are
+        detached ``hermes chat -q`` subprocesses, not session authorities), and the process sweep
+        that follows kills them mid-turn. Left to the crash sweep, each of those deaths booked
+        ``crashed``, charged the card's retry budget and could trip the breaker — one restart
+        auto-blocked a dozen cards.
+
+        Parking here, while this process is still alive to write the board, is the kanban analogue
+        of ``cron.scheduler.mark_running_jobs_interrupted`` at the same shutdown step: the run ends
+        ``interrupted``, the card returns to its retry lane, ``consecutive_failures`` is untouched.
+        Best-effort: a DB failure must never block a shutdown, and the crash sweep's
+        owner-attribution still books anything this misses.
+        """
+        def _park() -> list:
+            from hermes_cli.kanban_shutdown_park import park_owned_runs_best_effort
+            return park_owned_runs_best_effort(
+                "gateway restart" if self._restart_requested else "gateway shutdown"
+            )
+
+        def _run() -> None:
+            parked = _park()
+            if parked:
+                logger.warning(
+                    "Shutdown phase: parked %d in-flight kanban run(s) as interrupted before "
+                    "killing their workers (+%.2fs): %s",
+                    len(parked), ctx.elapsed(),
+                    ", ".join(f"{p['board']}/{p['task_id']}" for p in parked[:10]),
+                )
+
+        try:
+            await asyncio.wait_for(asyncio.to_thread(_run), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.warning("Shutdown phase: kanban parking timed out after 15s — continuing teardown")
+        except Exception as exc:  # noqa: BLE001 — shutdown must proceed regardless
+            logger.warning("Shutdown phase: kanban parking skipped (%s)", exc)
+
     async def _stop_begin_teardown(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
@@ -2201,6 +2239,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx), exit_code=1,
             )
         try:
+            await GatewayShutdownMixin._stop_park_kanban_runs(self, ctx)
             await GatewayRunner._stop_begin_teardown(self, ctx)
             timeout = effective_stop_drain_timeout(self)
             if timeout < self._restart_drain_timeout:

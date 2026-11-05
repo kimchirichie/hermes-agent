@@ -142,6 +142,9 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    interrupted: list[str] = field(default_factory=list)
+    """Task ids whose worker was killed by its owner's death (gateway restart, SIGKILL, OOM) and
+    released to its retry lane WITHOUT counting a failure — the run ended ``interrupted``."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1049,11 +1052,20 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    interrupted: bool = False
+    """Killed by its owner's death (gateway restart / SIGKILL / OOM), not by its own work.
+
+    Booked ``interrupted``: the card returns to its retry lane and ``consecutive_failures`` is
+    untouched, so one gateway restart cannot burn a dozen retry budgets or trip the breaker.
+    """
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall; an owner-caused death is
+        # recorded as ``interrupted`` for the same reason (it is not the card's fault).
+        if self.interrupted:
+            return "interrupted"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -1187,6 +1199,9 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    interrupted: list[str] = field(default_factory=list)
+    """Task ids whose run was killed by its owner's death (gateway restart/SIGKILL) and requeued
+    WITHOUT counting a failure — the run ended ``interrupted``, not ``crashed``."""
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1266,7 +1281,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
                 )
-            if dead.rate_limited:
+            if dead.interrupted:
+                # Killed by its owner's death, not by its own work: the run is already closed as
+                # ``interrupted`` above and the card is back in its retry lane. No
+                # ``_record_task_failure`` — the retry budget and the breaker stay untouched.
+                sweep.interrupted.append(row["id"])
+            elif dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
@@ -1372,6 +1392,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_interrupted = sweep.interrupted  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -2351,6 +2372,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.interrupted.extend(getattr(detect_crashed_workers, "_last_interrupted", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
