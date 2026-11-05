@@ -3401,6 +3401,29 @@ def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
     return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
 
 
+def review_awaits_human(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's latest review handoff asks for a HUMAN verdict.
+
+    A handoff that names no reviewer leaves the card assigned to the implementer that
+    asked for it. The review lane must not claim that card: dispatching it asks the
+    implementer to review its own work, and when the profile cannot load the
+    ``sdlc-review`` skill the lane forces, the spawn dies before its first turn and
+    burns the card's retry budget on a handoff that had already delivered. A named
+    reviewer reassigns the card (``request_review``), so it stays dispatchable.
+    """
+    event = _latest_event(conn, task_id, "review_requested")
+    if event is None:
+        return False
+    payload = _json_dict(_row_get(event, "payload"))
+    if _nonblank_str(payload.get("reviewer")):
+        return False
+    implementer = _canonical_assignee(_nonblank_str(payload.get("implementer")))
+    if implementer is None:
+        return False  # no provenance: never guess a self-review into existence
+    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return implementer == _canonical_assignee(_nonblank_str(_row_get(row, "assignee")))
+
+
 def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
