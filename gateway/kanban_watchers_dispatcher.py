@@ -269,11 +269,14 @@ class _KanbanDispatcher:
             return 0
         attempted = 0
         successes = 0
+        started = time.monotonic()
+        per_board: list[tuple[str, float]] = []
         from hermes_cli import kanban_db as _kb
         with _default_profile_secret_scope(), _kb.pin_first_board_resolution():
             for slug in self._board_slugs():
                 if attempted >= auto_decompose_per_tick:
                     break
+                board_started = time.monotonic()
                 try:
                     triage_ids = _decomp.list_triage_ids(board=slug)
                 except Exception as exc:
@@ -284,6 +287,18 @@ class _KanbanDispatcher:
                         break
                     attempted += 1
                     successes += self._decompose_one(_decomp, slug, tid)
+                    per_board.append((slug, time.monotonic() - board_started))
+                    board_started = time.monotonic()
+        if attempted:
+            # The tick's period is 60s PLUS this work, so a slow aux call here
+            # surfaces as a long gap between dispatch lines. One line per tick
+            # that did anything, with the boards that cost more than a second.
+            slow = sorted({s for s, secs in per_board if secs >= 1.0})
+            logger.info(
+                "kanban auto-decompose: %d attempted, %d decomposed in %.1fs%s",
+                attempted, successes, time.monotonic() - started,
+                f" (slow boards: {', '.join(slow)})" if slow else "",
+            )
         return successes
 
     @staticmethod

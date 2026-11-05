@@ -51,6 +51,22 @@ def initial_task_state(
     return "ready", tenant
 
 
+def has_decomposed_event(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when a decomposition was already committed for ``task_id``.
+
+    The ``decomposed`` event is written inside the fan-out transaction, so it
+    survives a re-triage or unlinking and is the ONE durable marker that a task
+    has already been fanned out. ``decompose_triage_task`` refuses a second
+    fan-out on it; callers that spend an LLM call BEFORE fanning out (the
+    decomposer, its gateway tick) must ask this first or they pay per attempt,
+    forever, for a task that can never decompose again.
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def _validate_children_graph(children: list) -> None:
     """DB-free shape check + Kahn's cycle check on the sibling graph (a cycle
     would deadlock every involved child in ``todo`` forever)."""
@@ -122,10 +138,7 @@ def decompose_triage_task(
             return None
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
-        if conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
-            (task_id,),
-        ).fetchone():
+        if has_decomposed_event(conn, task_id):
             return None
         child_ids = [
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)
