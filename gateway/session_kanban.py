@@ -275,9 +275,13 @@ def _run_worker_turns(agent, frame, history):
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    code, last_output = 1, ''
+    code, last_output, preflight = 1, '', False
+    # Did this attempt ever reach the model? A failure raised before the first turn is a
+    # pre-flight fault (unknown skill, unreadable workspace, agent construction): the same
+    # input produces the same exception, so the dispatcher must not retry it forever.
+    phase = {'turn_started': False}
     try:
-        result = _run_task_turns(agent, frame, history, context)
+        result = _run_task_turns(agent, frame, history, context, phase)
         code = turn_exit_code(result, kanban_worker=True)
         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
         return result
@@ -287,9 +291,10 @@ def _run_worker_turns(agent, frame, history):
         # Record it as the attempt's last output: the reclaim books that text on the board,
         # and without it the only trace was a traceback in the profile log.
         last_output = f'{type(exc).__name__}: {exc}'[:500]
+        preflight = not phase['turn_started']
         raise
     finally:
-        _record_worker_result(context, code, last_output)
+        _record_worker_result(context, code, last_output, preflight=preflight)
 
 
 def record_start_failure(frame, exc):
@@ -299,10 +304,11 @@ def record_start_failure(frame, exc):
     if context is None:
         return
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
+    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '',
+                          preflight=True)
 
 
-def _record_worker_result(context, code, last_output):
+def _record_worker_result(context, code, last_output, *, preflight=False):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -311,9 +317,13 @@ def _record_worker_result(context, code, last_output):
         if _bound_worker_matches(conn, context):
             # Closing a run clears its claim/PID and replaces metadata; keep the
             # result in the immutable attempt event stream instead.
-            kb._append_event(conn, context['task_id'], 'worker_result',
-                {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+            payload = {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                       'last_output': last_output}
+            if preflight:
+                # The attempt never reached the model: the reclaim reads this to park a card
+                # that keeps dying on its own configuration instead of retrying it forever.
+                payload['preflight'] = True
+            kb._append_event(conn, context['task_id'], 'worker_result', payload, run_id=context['run_id'])
 
 
 def record_worker_loss(policy, reason, *, pid=None, bound=False):
@@ -385,7 +395,7 @@ def worker_exit_code(path, params):
 KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'is_bot': True}
 
 
-def _run_task_turns(agent, frame, history, context):
+def _run_task_turns(agent, frame, history, context, phase=None):
     from agent.skill_commands import build_preloaded_skills_prompt
     skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
@@ -393,6 +403,10 @@ def _run_task_turns(agent, frame, history, context):
         # bare label cost an operator a grep through three profiles to find the request.
         raise ValueError('kanban_skills_unavailable: ' + ', '.join(missing))
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
+    if phase is not None:
+        # Everything above is pre-flight: no model call, no tool call. From here the attempt
+        # has real work in it, so a death is a retryable mid-work failure, not a bad config.
+        phase['turn_started'] = True
     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 
     def recover(nudge):

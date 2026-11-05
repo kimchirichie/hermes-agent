@@ -66,29 +66,41 @@ class _Board:
         self, tid: str = "t_ghost", *, worker_pid=None, owner_pid=None,
         admission=("terminal", "interrupted"), worker_lost: str | None = "EOFError",
         status: str = "running", failures: int = 0, max_retries=None, worker_exit: int | None = None,
+        preflight: bool = False, run_started: int | None = None, last_output: str = "",
     ) -> int:
         """A ``running`` card whose worker died under the named owner.
 
         *worker_exit* writes the attempt's own ``worker_result`` (the managed worker records it
-        before it dies); None leaves the attempt with no exit of its own.
+        before it dies); None leaves the attempt with no exit of its own. *preflight* adds the
+        worker's own "died before its first turn" marker, *run_started* moves the attempt's start
+        (default: ten minutes ago, i.e. not a fast-fail), *last_output* is the worker's own words.
+        Calling it again for the same task records a NEW attempt on the same card.
         """
         worker_pid = _absent_pid() if worker_pid is None else worker_pid
         owner_pid = _absent_pid(base=3_600_000) if owner_pid is None else owner_pid
         lock = f"{HOST}:{owner_pid}"
-        started = NOW - 600
+        started = NOW - 600 if run_started is None else run_started
         run_id = self.conn.execute(
             "INSERT INTO task_runs (task_id, profile, status, claim_lock, claim_expires, "
             "worker_pid, started_at) VALUES (?, 'default', 'running', ?, ?, ?, ?)",
             (tid, lock, NOW + 3600, worker_pid, started),
         ).lastrowid
         run = int(run_id)
-        self.conn.execute(
-            "INSERT INTO tasks (id, title, assignee, status, created_at, claim_lock, claim_expires, "
-            "worker_pid, worker_started_at, last_heartbeat_at, current_run_id, started_at, priority, "
-            "consecutive_failures, max_retries) VALUES (?, ?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?, 5, ?, ?)",
-            (tid, tid, status, NOW - 86400, lock, NOW + 3600, worker_pid, FINGERPRINT,
-             NOW - 30, run, started, failures, max_retries),
-        )
+        if self.conn.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone() is None:
+            self.conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, created_at, claim_lock, claim_expires, "
+                "worker_pid, worker_started_at, last_heartbeat_at, current_run_id, started_at, priority, "
+                "consecutive_failures, max_retries) VALUES (?, ?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?, 5, ?, ?)",
+                (tid, tid, status, NOW - 86400, lock, NOW + 3600, worker_pid, FINGERPRINT,
+                 NOW - 30, run, started, failures, max_retries),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = ?, claim_expires = ?, worker_pid = ?, "
+                "worker_started_at = ?, last_heartbeat_at = ?, current_run_id = ?, started_at = ? "
+                "WHERE id = ?",
+                (status, lock, NOW + 3600, worker_pid, FINGERPRINT, NOW - 30, run, started, tid),
+            )
         request_id = f'kanban:["default","{tid}",1]'
         self.event(tid, run, "claimed", {"source_status": "ready"}, started)
         self.event(tid, run, "spawned", {"pid": worker_pid, "started_at": FINGERPRINT}, started)
@@ -98,11 +110,14 @@ class _Board:
         if worker_lost:
             self.event(tid, run, "worker_lost", {"pid": worker_pid, "reason": worker_lost}, NOW - 40)
         if worker_exit is not None:
-            self.event(tid, run, "worker_result",
-                       {"pid": worker_pid, "claim_lock": lock, "exit_code": worker_exit,
-                        "last_output": ""}, NOW - 45)
+            payload = {"pid": worker_pid, "claim_lock": lock, "exit_code": worker_exit,
+                       "last_output": last_output}
+            if preflight:
+                payload["preflight"] = True
+            self.event(tid, run, "worker_result", payload, NOW - 45)
         if admission:
             with sqlite3.connect(self.ledger) as store:
+                store.execute("DELETE FROM session_admissions WHERE request_id = ?", (request_id,))
                 store.execute("INSERT INTO session_admissions VALUES ('sess-1', ?, ?, ?)",
                               (request_id, admission[0], admission[1]))
         self.conn.commit()
@@ -208,6 +223,113 @@ def test_a_worker_stopped_by_its_owner_books_interrupted(board):
     row = board.state("t_stopped")
     assert (row["status"], row["consecutive_failures"]) == ("ready", 2)
     assert board.run_row("t_stopped")["outcome"] == "interrupted"
+
+
+# --- pre-flight fast-fail: a card that fails on its own configuration parks ------------------
+
+def _gave_up(board, tid: str) -> dict:
+    row = board.conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'gave_up' ORDER BY id DESC LIMIT 1",
+        (tid,)).fetchone()
+    return json.loads(row["payload"]) if row else {}
+
+
+def test_a_deterministic_preflight_failure_parks_the_card_after_one_attempt(board):
+    """The measured loop: ``skills=['omni-pipeline-ops']``, worker dies in ~2s with
+    ``ValueError: kanban_skills_unavailable``. One attempt, then parked typed ``capability``
+    with the exception on the card — not respawned every tick until someone greps three profiles.
+    """
+    board.dead_attempt("t_bad_skill", owner_pid=os.getpid(), worker_exit=1, preflight=True,
+                       run_started=NOW - 2,
+                       last_output="ValueError: kanban_skills_unavailable: omni-pipeline-ops")
+
+    assert kbd.detect_crashed_workers(board.conn, board="default") == ["t_bad_skill"]
+    row, run = board.state("t_bad_skill"), board.run_row("t_bad_skill")
+    assert (row["status"], row["block_kind"]) == ("blocked", "capability")
+    assert row["consecutive_failures"] == 1
+    assert "kanban_skills_unavailable" in (row["last_failure_error"] or "")
+    assert (run["status"], run["outcome"]) == ("crashed", "crashed")
+
+    gave_up = _gave_up(board, "t_bad_skill")
+    assert gave_up["preflight"] is True and gave_up["preflight_deterministic"] is True
+    assert "kanban_skills_unavailable: omni-pipeline-ops" in gave_up["error_line"]
+    assert gave_up["block_kind"] == "capability"
+
+
+def test_a_nondeterministic_preflight_failure_parks_on_the_second_attempt(board):
+    """No tool call, no model call, but not a fault the card names: two attempts, then park."""
+    board.dead_attempt("t_preflight_2", owner_pid=os.getpid(), worker_exit=1, preflight=True,
+                       run_started=NOW - 3, last_output="RuntimeError: agent bootstrap exploded")
+    assert kbd.detect_crashed_workers(board.conn, board="default") == ["t_preflight_2"]
+    row = board.state("t_preflight_2")
+    assert (row["status"], row["consecutive_failures"], row["block_kind"]) == ("ready", 1, None)
+
+    board.dead_attempt("t_preflight_2", owner_pid=os.getpid(), worker_exit=1, preflight=True,
+                       run_started=NOW - 3, last_output="RuntimeError: agent bootstrap exploded")
+    assert kbd.detect_crashed_workers(board.conn, board="default") == ["t_preflight_2"]
+    row = board.state("t_preflight_2")
+    assert (row["status"], row["consecutive_failures"], row["block_kind"]) == ("blocked", 2, "capability")
+    assert _gave_up(board, "t_preflight_2")["preflight_deterministic"] is False
+
+
+def test_a_fast_deterministic_failure_parks_even_when_the_preflight_flag_never_landed(board):
+    """The reclaim can beat the worker's own ``worker_result`` write (it sees the dead submitter a
+    moment before the bound interpreter finishes its finally block). A fast non-zero exit whose
+    own words name a card-config fault is the same class without the flag."""
+    board.dead_attempt("t_flag_raced", owner_pid=os.getpid(), worker_exit=1, preflight=False,
+                       run_started=NOW - 2,
+                       last_output="ValueError: kanban_skills_unavailable: omni-pipeline-ops")
+    assert kbd.detect_crashed_workers(board.conn, board="default") == ["t_flag_raced"]
+    row = board.state("t_flag_raced")
+    assert (row["status"], row["block_kind"], row["consecutive_failures"]) == ("blocked", "capability", 1)
+    assert _gave_up(board, "t_flag_raced")["preflight_deterministic"] is True
+
+
+def test_a_slow_preflight_shaped_failure_keeps_the_ordinary_retry_budget(board):
+    """The seconds bound: fast AND before the first turn, never one of the two. A worker that was
+    queued for a minute and then died pre-flight is not parked on its first attempt."""
+    board.dead_attempt("t_slow_preflight", owner_pid=os.getpid(), worker_exit=1, preflight=True,
+                       run_started=NOW - 60,
+                       last_output="ValueError: kanban_skills_unavailable: omni-pipeline-ops")
+    assert kbd.detect_crashed_workers(board.conn, board="default") == ["t_slow_preflight"]
+    row = board.state("t_slow_preflight")
+    assert (row["status"], row["consecutive_failures"], row["block_kind"]) == ("ready", 1, None)
+
+
+def test_a_capability_park_survives_recompute_ready(board):
+    """The park trips below every ``failure_limit``, so the counter cannot hold it: without the
+    sticky marker ``recompute_ready`` promotes it in the same tick and the card respawns forever —
+    the loop wearing a different hat."""
+    board.dead_attempt("t_sticky_park", owner_pid=os.getpid(), worker_exit=1, preflight=True,
+                       run_started=NOW - 2,
+                       last_output="ValueError: kanban_skills_unavailable: omni-pipeline-ops")
+    assert kbd.detect_crashed_workers(board.conn, board="default") == ["t_sticky_park"]
+    assert board.state("t_sticky_park")["status"] == "blocked"
+
+    assert kb.recompute_ready(board.conn, failure_limit=3) == 0
+    assert board.state("t_sticky_park")["status"] == "blocked"
+
+
+def test_a_midwork_crash_still_retries_up_to_the_failure_limit(board):
+    """Regression guard for the legitimate retry path: a worker that died mid-work (gateway
+    restart, OOM, tool timeout) has real work in it and must still get ``failure_limit`` tries."""
+    board.dead_attempt("t_midwork", owner_pid=os.getpid(), worker_exit=1, admission=("terminal", "completed"),
+                       last_output="ToolError: terminal timeout")
+    assert kbd.detect_crashed_workers(board.conn, board="default") == ["t_midwork"]
+    row = board.state("t_midwork")
+    assert (row["status"], row["consecutive_failures"]) == ("ready", 1)
+    assert row["block_kind"] is None
+    assert "preflight" not in _gave_up(board, "t_midwork")
+
+
+def test_failure_line_quotes_the_workers_own_exception_once():
+    """The one line a notice carries: the worker's exception, not our pid preamble."""
+    text = ("pid 91036 exited with code 1 [managed worker lost: managed_worker_failed]"
+            " Worker's last output: 'ValueError: kanban_skills_unavailable: skills=[omni-pipeline-ops]'")
+    line = kbd._failure_line(text)
+    assert line == "ValueError: kanban_skills_unavailable: skills=[omni-pipeline-ops]"
+    assert kbd._failure_line("workspace: ValueError: board 'cs' default_workdir '/x' is not inside a git repo") \
+        == "workspace: ValueError: board 'cs' default_workdir '/x' is not inside a git repo"
 
 
 # --- shutdown path: park before the workers are killed -------------------------------------

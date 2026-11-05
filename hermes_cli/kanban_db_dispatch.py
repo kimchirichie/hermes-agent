@@ -36,6 +36,27 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# A run that dies before its first turn has no work in it to retry: skill resolution, prompt
+# assembly and agent construction run on the same card input every time, so the same exception
+# comes back. Two of those in a row park the card instead of spending the whole retry budget; a
+# DETERMINISTIC pre-flight fault (an unknown skill, a workspace that is not a git repo, a
+# workspace path that cannot exist) parks it after ONE, because no retry can change the input.
+# The seconds bound keeps a slow-but-legitimate attempt out of this class: it must have failed
+# fast AND before the model, never one of the two.
+PREFLIGHT_FAILURE_SECONDS = 10
+PREFLIGHT_FAILURE_LIMIT = 2
+DETERMINISTIC_FAILURE_LIMIT = 1
+
+# Pre-flight faults that are functions of the card's own configuration. Matched against the
+# attempt's error text (ours + the worker's last output) to pick the one-attempt limit.
+_DETERMINISTIC_FAILURE_RE = re.compile(
+    r"kanban_skills_unavailable|unknown skills?\b"
+    r"|is not inside a git repo|has non-absolute"
+    r"|but no workspace_path|unknown workspace_kind"
+    r"|no such (?:hermes )?profile|profile not found",
+    re.IGNORECASE,
+)
+
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
 # before max_runtime_seconds kills it.
@@ -1059,6 +1080,13 @@ class _DeadWorker:
     untouched, so one gateway restart cannot burn a dozen retry budgets or trip the breaker.
     """
 
+    preflight: bool = False
+    """The attempt recorded that it died BEFORE its first turn, within
+    ``PREFLIGHT_FAILURE_SECONDS`` — a bad card configuration, not a transient fault.
+
+    Set by the reclaim from the run's own ``worker_result``; see ``_preflight_attempt``.
+    """
+
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
@@ -1210,6 +1238,46 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+def _preflight_attempt(conn: sqlite3.Connection, row, pid: int, dead: _DeadWorker) -> None:
+    """Mark a death that happened BEFORE the attempt's first turn — and fast.
+
+    The worker records ``preflight`` on its own ``worker_result`` when the exception was raised in
+    skill resolution, prompt assembly or agent construction: no model call, no tool call, so the
+    card's own input reproduces the fault on every retry. Bounded by ``PREFLIGHT_FAILURE_SECONDS``
+    so a legitimately slow attempt (queued behind a busy owner, then crashed) keeps the ordinary
+    retry budget instead of being parked as a config error.
+
+    A rate-limited, protocol-violating or interrupted attempt is already booked on its own merits
+    and never reaches here. Best-effort: any unreadable field leaves the ordinary booking alone.
+    """
+    if dead.interrupted or dead.rate_limited or dead.protocol_violation:
+        return
+    from hermes_cli.kanban_owner_recovery import managed_run_preflight
+    try:
+        managed = managed_run_preflight(conn, row["id"], pid, row["claim_lock"])
+        if not managed and not (dead.code and _DETERMINISTIC_FAILURE_RE.search(dead.error_text)):
+            # A plain spawned worker leaves no preflight flag, but a fast non-zero exit whose own
+            # words name one of the card-config faults is the same deterministic case.
+            return
+        run_id = _kb._row_get(row, "current_run_id")
+        if run_id is None:
+            return
+        run = conn.execute("SELECT started_at FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
+        if run is None:
+            return
+        started = _kb._to_epoch(run[0])
+    except (sqlite3.Error, TypeError, ValueError):
+        return
+    if started is None:
+        return
+    elapsed = max(0.0, time.time() - started)
+    if elapsed > PREFLIGHT_FAILURE_SECONDS:
+        return
+    dead.preflight = True
+    dead.event_payload["preflight"] = True
+    dead.event_payload["elapsed_seconds"] = round(elapsed, 1)
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
@@ -1243,6 +1311,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board,
                                          conn=conn, run_id=_kb._row_get(row, "current_run_id"))
             apply_attempt_note(conn, row["id"], pid, dead)
+            _preflight_attempt(conn, row, pid, dead)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1360,14 +1429,30 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
                 extra["sticky"] = True
+            limit = None
+            block_kind = None
+            if dead.preflight:
+                # Died before its first turn, fast. Nothing the worker did is being retried, so
+                # the budget it deserves is small: one attempt when the fault is a function of
+                # the card's own configuration, two when it is merely suspicious. The card parks
+                # typed ``capability`` so the board says "fix the card", not "blocked", and
+                # ``sticky`` because that limit is below every ``failure_limit``: without the
+                # marker ``recompute_ready`` would promote it straight back and respawn it.
+                deterministic = bool(_DETERMINISTIC_FAILURE_RE.search(error_text))
+                limit = DETERMINISTIC_FAILURE_LIMIT if deterministic else PREFLIGHT_FAILURE_LIMIT
+                block_kind = "capability"
+                extra["sticky"] = True
+                extra["preflight"] = True
+                extra["preflight_deterministic"] = deterministic
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=1 if is_systemic else limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
+                block_kind=block_kind,
             )
         if tripped:
             auto_blocked.append(tid)
@@ -1424,6 +1509,21 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     return sweep.crashed
 
 
+def _failure_line(error: str, limit: int = 160) -> str:
+    """One line naming WHY, for a notice a human reads.
+
+    The worker's own last output when it named one (``ValueError: kanban_skills_unavailable:
+    skills=[omni-pipeline-ops]``), else our head sentence. Quoted repr is unwrapped and the text
+    is cut to one line: a blocked notice that says only "blocked" costs a grep through three
+    profiles to find the request.
+    """
+    head, sep, output = error.partition(WORKER_OUTPUT_SEP)
+    text = output.strip() if sep and output.strip() else head
+    text = text.strip().strip("'\"").strip()
+    first = text.splitlines()[0].strip() if text else ""
+    return first[:limit]
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1436,6 +1536,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    block_kind: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1507,23 +1608,30 @@ def _record_task_failure(
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
-        # state; the timeout/crash path already did.
+        # state; the timeout/crash path already did. A trip that a human must act on
+        # (``block_kind='capability'``: bad card config, nothing a retry can change) is typed
+        # here so the board says what it needs instead of an untyped "blocked".
         conn.execute(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
+            + ("block_kind = ?, block_recurrences = 1, " if block_kind else "")
             + "consecutive_failures = ?, last_failure_error = ? "
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+            ((block_kind,) if block_kind else ()) + (failures, error, task_id),
         )
         payload = {
             "failures": failures,
             "effective_limit": effective_limit,
             "limit_source": limit_source,
             "error": error,
+            # The one line a notice quotes: the worker's own exception when it named one.
+            "error_line": _failure_line(error),
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
+        if block_kind:
+            payload["block_kind"] = block_kind
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
@@ -2277,9 +2385,16 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        # A workspace that cannot exist (no path, not a git repo, relative path) is a fault of the
+        # card's own configuration: one attempt, then park it typed, instead of spending the whole
+        # retry budget on an input that cannot change.
+        deterministic = bool(_DETERMINISTIC_FAILURE_RE.search(str(exc)))
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            outcome="spawn_failed",
+            failure_limit=DETERMINISTIC_FAILURE_LIMIT if deterministic else failure_limit,
+            release_claim=True, end_run=True,
+            block_kind="capability" if deterministic else None,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -2311,10 +2426,17 @@ def _dispatch_lane_task(
         infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
+        # A spawn the host refuses for a reason the card's own configuration names (a worktree that
+        # is not a git repo, a profile that is not on disk) fails identically every time: one
+        # attempt, then a typed park.
+        deterministic = not infrastructure and bool(_DETERMINISTIC_FAILURE_RE.search(str(exc)))
         if _record_task_failure(
             conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            outcome="spawn_failed",
+            failure_limit=DETERMINISTIC_FAILURE_LIMIT if deterministic else failure_limit,
+            release_claim=True, end_run=True,
             infrastructure=infrastructure,
+            block_kind="capability" if deterministic else None,
         ):
             result.auto_blocked.append(claimed.id)
         return False
