@@ -305,6 +305,24 @@ def build_environment(
     }))
 
 
+def rebuild_environment(
+    *, source: Path, out: Path, python: Path | None = None,
+    cache: Path | None = None, env: Mapping[str, str] | None = None,
+    extras: Sequence[str] = (), groups: Sequence[str] = (),
+    all_extras: bool = False, no_install_project: bool = False,
+    frozen: bool = True, sealed: bool = False, offline: bool = False,
+    explicit: bool = False, timeout: int = 1800,
+) -> Path:
+    """Replace an existing environment at *out* atomically (``pm.operations.rebuild_environment``)."""
+    return Path(_python_operation("rebuild_environment", {
+        "source": Path(source), "out": Path(out), "python": python, "cache": cache,
+        "env": dict(env) if env is not None else None, "extras": list(extras), "groups": list(groups),
+        "all_extras": all_extras, "no_install_project": no_install_project,
+        "frozen": frozen, "sealed": sealed, "offline": offline,
+        "explicit": explicit, "timeout": timeout,
+    }))
+
+
 def lock_project(
     source: Path, *, upgrade: bool = False, python: Path | None = None,
     env: Mapping[str, str] | None = None, cache: Path | None = None,

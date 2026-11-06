@@ -25,7 +25,7 @@ _EXPORTS = {
         "installed_package", "lazy_installs_allowed", "store_first_path", "uv_launcher",
     ),
     "pm.client": (
-        "ensure", "sync_venv", "build_environment", "lock_project", "stage_manager_runtime",
+        "ensure", "sync_venv", "build_environment", "rebuild_environment", "lock_project", "stage_manager_runtime",
         "ensure_environment", "ensure_project_environment", "ensure_python_tool", "venv_is_current", "check_project_lock",
         "export_requirements", "build_requirements_environment", "prune_cache", "stage_tools",
         "prepare_tools",
