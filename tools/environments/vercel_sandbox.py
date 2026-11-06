@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from hermes_cli.config_defaults import DEFAULT_VERCEL_IMAGE
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, profile_name_for_home
 from tools.environments.base import BaseEnvironment, _load_json_store, _update_json_store
 from tools.environments.base_output import _ThreadedProcessHandle
 from tools.environments.file_sync import FileSyncManager, iter_sync_files, quoted_rm_command
@@ -328,6 +328,10 @@ class VercelSandboxEnvironment(BaseEnvironment):
             # is exactly what an ephemeral Hermes filesystem wants; a persistent one is sent as
             # persistent=True so its snapshot survives to be restored.
             "persistent": self._persistent,
+            # Attribution for the sweeper: a stopped box that outlives its run is otherwise an
+            # anonymous colour-animal name, and "which lane leaks" could only be guessed from
+            # timestamps. The profile id is the lane.
+            "tags": self._sandbox_tags(),
             "resources": SandboxResources(vcpus=vcpus, memory=memory_mb) if vcpus is not None else None}
         if self._snapshot_expiration is not None:
             self._create_kwargs["snapshot_expiration"] = self._snapshot_expiration
@@ -402,8 +406,9 @@ class VercelSandboxEnvironment(BaseEnvironment):
             self._run_checked(f"bash {shlex.quote(_SETUP_SCRIPT_REMOTE)}", "setup",
                               tail=_SETUP_OUTPUT_TAIL, timeout=self._setup_timeout)
         except Exception:
-            # Construction raises, so cleanup() never runs: stop the half-set-up box here.
-            self._stop_sandbox(self._sandbox)
+            # Construction raises, so cleanup() never runs: stop the half-set-up box here
+            # (and destroy it — a stopped box is still an object the sweeper would have to mop).
+            self._retire_sandbox(self._sandbox)
             self._sandbox = None
             raise
 
@@ -434,6 +439,44 @@ class VercelSandboxEnvironment(BaseEnvironment):
             return
         with contextlib.suppress(Exception):
             sandbox.stop()
+
+    @staticmethod
+    def _sandbox_tags() -> dict[str, str]:
+        """Tags sent at creation: the profile id says which lane owns the box."""
+        tags = {"hermes": "sandbox"}
+        profile = profile_name_for_home(get_hermes_home())
+        if profile:
+            tags["hermes_profile"] = profile
+        return tags
+
+    def _retire_sandbox(self, sandbox: SyncSandbox | None, *, adopt_snapshot: bool = False) -> None:
+        """End a sandbox's life: stop it and destroy the object unless it IS a restore point.
+
+        ``stop()`` is not an end. Vercel keeps a stopped sandbox in the project's list until
+        something destroys it — the object has no TTL (only its snapshot expires) — so stopping
+        the box at teardown and walking away leaves one object per run behind. Measured
+        2026-11-06: the nightly sweeper was destroying 236 → 269 → 299 of them and nothing else
+        ever did; the mop was the only reclamation path.
+
+        The one box worth keeping is a persistent task's, whose stop snapshot is what the next
+        create restores from (``destroy()`` keeps snapshots, but read the id before removing the
+        object). Everything else — an ephemeral env, a failed setup, a killed command — is
+        destroyed here.
+        """
+        self._stop_sandbox(sandbox)
+        if sandbox is None:
+            return
+        if adopt_snapshot:
+            self._adopt_stop_snapshot(sandbox)
+        if self._persistent and adopt_snapshot:
+            return
+        try:
+            sandbox.destroy()
+        except Exception as exc:
+            # A failed destroy is a billable leftover, not a failed teardown: the nightly sweep
+            # still reclaims it, so warn with the name rather than raising out of cleanup().
+            logger.warning("Vercel: could not destroy sandbox %s for task %s; it stays stopped "
+                           "until the sweeper reclaims it: %s", sandbox.name, self._task_id, exc)
 
     def _adopt_stop_snapshot(self, sandbox: SyncSandbox) -> None:
         """Store the snapshot Vercel took when *sandbox* stopped, as this task's restore point.
@@ -578,7 +621,9 @@ class VercelSandboxEnvironment(BaseEnvironment):
             with lock:
                 state["cancelled"] = True
                 scrub_staged()
-                self._stop_sandbox(sandbox)
+                # A killed command leaves the box unusable; retire it rather than stopping it
+                # into the project's stopped-sandbox backlog.
+                self._retire_sandbox(sandbox)
 
         def exec_fn() -> tuple[str, int]:
             command = cmd_string
@@ -619,9 +664,9 @@ class VercelSandboxEnvironment(BaseEnvironment):
         if sandbox is None:
             return
         # Stop FIRST on a persistent env: the stop is what asks Vercel for the snapshot, so the
-        # id to remember does not exist until then (see _adopt_stop_snapshot).
-        self._stop_sandbox(sandbox)
-        self._adopt_stop_snapshot(sandbox)
+        # id to remember does not exist until then (see _adopt_stop_snapshot). Then destroy the
+        # object itself — a stopped sandbox is a live object with no TTL, not a reclaimed one.
+        self._retire_sandbox(sandbox, adopt_snapshot=True)
         client, self._client = self._client, None
         if client is not None:
             with contextlib.suppress(Exception):

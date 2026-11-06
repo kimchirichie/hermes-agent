@@ -131,6 +131,8 @@ class _FakeSandbox:
         self.read_bytes_side_effects: list[object] = []
         self.read_bytes_content = b""
         self.stop_calls: list[tuple[tuple, dict]] = []
+        self.destroy_calls: list[tuple[tuple, dict]] = []
+        self.destroy_error: Exception | None = None
         self.snapshot_calls: list[tuple[tuple, dict]] = []
         self.snapshot_side_effects: list[object] = []
         self.snapshot_id = "snap_default"
@@ -160,6 +162,13 @@ class _FakeSandbox:
         # sandbox afterwards — the id does not exist before the stop.
         if self.snapshot_id_on_stop is not None:
             self.current_snapshot_id = self.snapshot_id_on_stop
+
+    def destroy(self, *args, **kwargs) -> None:
+        """Mirror of ``SyncSandbox.destroy``: removes the object; snapshots survive it."""
+        self.destroy_calls.append((args, kwargs))
+        if self.destroy_error is not None:
+            raise self.destroy_error
+        self.status = _FakeSandboxStatus.STOPPED
 
     def snapshot(self, *args, **kwargs):
         self.snapshot_calls.append((args, kwargs))
@@ -627,6 +636,30 @@ class TestExecute:
         assert kwargs["capture_output"] is True
 
 
+    def test_killed_command_destroys_the_ephemeral_sandbox(self, make_env):
+        """The timeout path: a command killed mid-run retires its box instead of leaving it
+        stopped in the project's backlog."""
+        env = make_env(persistent_filesystem=False)
+        sandbox = env._sandbox
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_command(_cmd: str, _args: list[str], _kwargs: dict):
+            started.set()
+            release.wait(timeout=5)
+            return _FakeRunResult("done")
+
+        sandbox.run_process_side_effects.append(blocking_command)
+
+        handle = env._run_bash("sleep 600")
+        assert started.wait(timeout=1)
+        handle.kill()
+        release.set()
+
+        assert handle.wait(timeout=2) == 0
+        assert len(sandbox.stop_calls) == 1
+        assert len(sandbox.destroy_calls) == 1
+
     def test_payload_stdin_is_staged_byte_exact_not_in_argv(self, make_env):
         env = make_env()
         sandbox = env._sandbox
@@ -766,6 +799,58 @@ class TestSnapshotPersistence:
         # persistent=False produces no automatic snapshot, and Hermes must not adopt one anyway.
         assert vercel_module._load_snapshots() == {}
 
+    def test_ephemeral_cleanup_destroys_the_sandbox_object(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        """A stop is not an end: Vercel keeps a stopped box until something destroys it, so an
+        ephemeral run must destroy its own object instead of leaving it for the nightly sweep."""
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        env = make_env(persistent_filesystem=False)
+        sandbox = vercel_sdk.current
+
+        env.cleanup()
+        env.cleanup()
+
+        assert len(sandbox.stop_calls) == 1
+        assert len(sandbox.destroy_calls) == 1, "one stop, one destroy — then nothing to mop"
+
+    def test_persistent_cleanup_keeps_the_box_that_is_its_restore_point(
+        self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
+    ):
+        """A persistent task's stopped box is what its next create restores from: do not remove
+        the object here (the sweeper reclaims it once the task stops using it)."""
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        env = make_env()
+        sandbox = vercel_sdk.current
+        sandbox.snapshot_id_on_stop = "snap_keep"
+
+        env.cleanup()
+
+        assert len(sandbox.stop_calls) == 1
+        assert sandbox.destroy_calls == []
+        assert vercel_module._load_snapshots() == {"task-123": "snap_keep"}
+
+    def test_destroy_failure_warns_instead_of_failing_teardown(self, make_env, vercel_sdk):
+        env = make_env(persistent_filesystem=False)
+        sandbox = vercel_sdk.current
+        sandbox.destroy_error = RuntimeError("destroy unavailable")
+
+        env.cleanup()
+
+        assert len(sandbox.stop_calls) == 1
+        assert len(sandbox.destroy_calls) == 1
+        # The env is still torn down: the sweeper is the backstop, a raise here would mask the run.
+
+    def test_create_sends_the_lane_tag(self, make_env, vercel_sdk, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "ms-worker"))
+
+        make_env()
+
+        assert vercel_sdk.create_kwargs[-1]["tags"] == {"hermes": "sandbox",
+                                                       "hermes_profile": "ms-worker"}
+
     def test_persistent_cleanup_without_task_id_stops_without_snapshot(
         self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
     ):
@@ -900,6 +985,7 @@ class TestSetupScript:
             make_env(setup_script=str(script))
 
         assert len(sandbox.stop_calls) == 1, "a failed setup must not leave the sandbox running"
+        assert len(sandbox.destroy_calls) == 1, "nor leave a stopped object for the sweeper"
         assert self._init_session_runs(sandbox) == [], "the box was never marked ready"
 
     def test_recreate_runs_setup_again_on_the_new_box(
