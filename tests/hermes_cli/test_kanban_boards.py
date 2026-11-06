@@ -330,8 +330,13 @@ class TestWorkerSpawnEnv:
 # ---------------------------------------------------------------------------
 
 def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.CompletedProcess:
-    """Run ``hermes kanban …`` with PYTHONPATH pinned to the worktree."""
-    env = dict(os.environ)
+    """Run ``hermes kanban …`` with PYTHONPATH pinned to the worktree.
+
+    The kanban env pins are stripped first: a test process that inherits a
+    dispatcher's ``HERMES_KANBAN_DB``/``HERMES_KANBAN_BOARD`` would run every
+    ``--board`` assertion against a live board instead of the temp home.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN_")}
     env["PYTHONPATH"] = str(_WORKTREE)
     if env_extra:
         env.update(env_extra)
@@ -430,3 +435,115 @@ class TestBoardResurrection:
         assert meta["name"] == "My Board"
         assert "keepname" in [b["slug"] for b in kb.list_boards(include_archived=True)]
         assert "keepname" not in [b["slug"] for b in kb.list_boards(include_archived=False)]
+
+
+# ---------------------------------------------------------------------------
+# Schema-less husks: an existing DB that cannot serve `tasks` is not "empty"
+# ---------------------------------------------------------------------------
+
+def _make_husk(path: Path) -> None:
+    """Write the exact shape an init leaves when it dies before SCHEMA_SQL.
+
+    ``journal_mode=WAL`` materializes page 1, so the file is a valid 4096-byte
+    SQLite database with zero tables — indistinguishable from a real board to
+    everything except a table count.
+    """
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)  # a real board DB would otherwise keep its schema
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.commit()
+    finally:
+        conn.close()
+    assert path.stat().st_size > 0
+
+
+class TestSchemaLessHusk:
+    """A board DB with no schema must fail loudly, never list zero tasks."""
+
+    def test_probe_matches_aborted_init_shape(self, tmp_path):
+        husk = tmp_path / "kanban.db"
+        _make_husk(husk)
+        assert kbc._schema_less_husk_reason(husk) is not None
+
+    def test_probe_ignores_zero_byte_db(self, tmp_path):
+        empty = tmp_path / "kanban.db"
+        empty.touch()
+        assert kbc._schema_less_husk_reason(empty) is None
+
+    def test_probe_ignores_real_board(self, fresh_home):
+        kb.create_board("real")
+        assert kbc._schema_less_husk_reason(kb.board_dir("real") / "kanban.db") is None
+
+    def test_connect_refuses_husk_and_leaves_it_alone(self, fresh_home):
+        husk = fresh_home / "kanban.db"
+        _make_husk(husk)
+        before = husk.read_bytes()
+        with pytest.raises(kbc.KanbanDbHuskError, match="no schema"):
+            kbc.connect(board="default")
+        assert husk.read_bytes() == before, "the husk must not be 'repaired' into an empty board"
+
+    def test_connect_still_initializes_a_fresh_board(self, fresh_home):
+        with kbc.connect_closing(board=None) as conn:
+            assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+
+    def test_create_board_initializes_through_zero_byte_file(self, fresh_home):
+        kb.create_board("fresh")
+        with kbc.connect_closing(board="fresh") as conn:
+            assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+
+    def test_cli_list_marks_husk_unreadable_and_keeps_other_boards(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "healthy"], env_extra=env).returncode == 0
+        _make_husk(tmp_path / "kanban" / "boards" / "healthy" / "kanban.db")
+
+        r = _cli(["boards", "list"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "UNREADABLE" in r.stdout
+        # The healthy sibling must still render — one broken board cannot hide the rest.
+        assert "default" in r.stdout
+
+    def test_cli_list_husk_is_not_reported_empty(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "husked"], env_extra=env).returncode == 0
+        _make_husk(tmp_path / "kanban" / "boards" / "husked" / "kanban.db")
+
+        r = _cli(["boards", "list", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        rows = {b["slug"]: b for b in json.loads(r.stdout)}
+        assert rows["husked"]["counts"] == {}
+        assert rows["husked"]["counts_error"], "an unreadable board must carry its error, not read as empty"
+
+    def test_dashboard_boards_payload_carries_counts_error(self, fresh_home):
+        from plugins.kanban.dashboard import plugin_api
+
+        counts, error = plugin_api._board_counts("default")
+        assert counts == {} and error is None  # no DB on disk yet: genuinely empty
+
+
+class TestCreateNamesItsBoard:
+    """``create`` must say where the card landed and flag a cross-board filing."""
+
+    def test_create_prints_board_slug(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        r = _cli(["create", "Filed card", "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "board=default" in r.stdout
+        # default is the active board (no `current` file), so no cross-board note.
+        assert "active board is" not in r.stderr
+
+    def test_create_off_the_active_board_says_so(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "work"], env_extra=env).returncode == 0
+        assert _cli(["boards", "switch", "work"], env_extra=env).returncode == 0
+
+        r = _cli(["--board", "default", "create", "Off-board card", "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        assert "board=default" in r.stdout
+        assert "active board is 'work'" in r.stderr
+        assert "boards switch default" in r.stderr
+

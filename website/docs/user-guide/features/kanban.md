@@ -146,6 +146,34 @@ called `default` (DB at `~/.hermes/kanban.db` for back-compat). Users who
 only want one stream of work never need to know about boards; the feature
 is opt-in.
 
+### Where each board's DB actually lives
+
+One slug maps to exactly one file, and the CLI, the dashboard, the gateway
+dispatcher and every spawned worker resolve it the same way:
+
+| Board | DB path |
+|---|---|
+| `default` | `<hermes-home>/kanban.db` — **back-compat alias, not a directory board** |
+| any other slug | `<hermes-home>/kanban/boards/<slug>/kanban.db` |
+
+`boards/default/` exists but holds metadata only (`board.json`,
+`attachments/`); it is **never** a database location. Do not create a
+`kanban.db` there — nothing reads it, so cards in it are invisible and
+`boards list` is the only thing that would ever look. `HERMES_KANBAN_DB`
+(injected into workers) overrides the file for that process.
+
+A board whose DB file exists, is non-empty, and has **no `tasks` table** is
+refused with an error rather than opened as an empty board: that shape means
+an initialization was interrupted or the file was replaced, and "repairing"
+it would silently turn a broken board into an empty one. `boards list` shows
+such a board as `UNREADABLE (<reason>)`, and the dispatcher quarantines it
+like a corrupt DB until the file changes. A 0-byte `kanban.db` is a normal
+fresh board and is initialized on first use.
+
+`hermes kanban create` prints the board it wrote to, and warns when that is
+not the active board — a card filed on `default` while you are looking at
+`personal` is durable and correct, just not on screen.
+
 Per-board isolation is absolute:
 
 - Separate SQLite DB per board (`~/.hermes/kanban/boards/<slug>/kanban.db`).

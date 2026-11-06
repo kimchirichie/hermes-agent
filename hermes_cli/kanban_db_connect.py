@@ -291,6 +291,63 @@ def _validate_sqlite_header(path: Path) -> None:
     )
 
 
+class KanbanDbHuskError(RuntimeError):
+    """Raised when a board's DB file exists but carries no schema.
+
+    A brand-new board is a 0-byte file that :func:`connect` initializes. A
+    *non-empty* SQLite file with zero tables is something else entirely: an
+    init that died between WAL activation and ``SCHEMA_SQL``, or a file
+    clobbered in place. Running the schema pass on it turns a broken board into
+    an empty one, which every reader then reports as "no tasks" — the failure
+    mode looks exactly like a quiet morning. Fail closed and name the file.
+    """
+
+    def __init__(self, db_path: Path, reason: str):
+        self.db_path = db_path
+        self.reason = reason
+        super().__init__(
+            f"kanban DB {db_path} exists but has no schema: {reason}. "
+            "Refusing to open it as an empty board — restore it from a backup or "
+            "remove the file to initialize a fresh board."
+        )
+
+
+def _schema_less_husk_reason(path: Path) -> Optional[str]:
+    """Why ``path`` is a schema-less husk, or ``None`` when it is not one.
+
+    Missing and 0-byte files are boards :func:`connect` may initialize. The
+    probe writes nothing: it opens ``immutable=1`` so no ``-wal``/``-shm``
+    sidecar is created (and so it works on a volume where a WAL database cannot
+    be opened read-only at all), and it trusts a zero table count only when the
+    main file is the whole story — a non-empty ``-wal`` may hold the schema the
+    main file lacks.
+    """
+    try:
+        if path.stat().st_size == 0:
+            return None
+    except OSError:
+        return None
+    try:
+        wal = path.with_name(path.name + "-wal")
+        if wal.exists() and wal.stat().st_size > 0:
+            return None  # schema may live in the WAL; the normal open path sees it
+    except OSError:
+        return None
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?immutable=1", uri=True)
+    except sqlite3.Error:
+        return None  # not openable at all: the header/integrity guards own that
+    try:
+        row = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        conn.close()
+    if row and int(row[0]) == 0:
+        return "the file is a valid SQLite database containing zero tables"
+    return None
+
+
 class KanbanDbCorruptError(RuntimeError):
     """Raised when an existing kanban DB file fails integrity checks — a
     fail-closed guard against silently recreating a corrupt board (which would
@@ -733,6 +790,13 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
         return conn
     _refuse_dead_board_resurrection(path, board)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Probe for a schema-less husk BEFORE anything opens the file: the first open
+    # materializes page 1 (WAL), so a legitimately 0-byte board would look
+    # identical to a clobbered one afterwards. Here the on-disk bytes are still
+    # exactly what the caller handed us.
+    husk_reason = _schema_less_husk_reason(path)
+    if husk_reason:
+        raise KanbanDbHuskError(path, husk_reason)
 
     # Fast path: once THIS process has initialized this path, skip the
     # cross-process init lock. Taking it on every connect let a single stalled

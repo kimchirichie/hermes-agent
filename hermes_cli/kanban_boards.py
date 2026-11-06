@@ -23,15 +23,20 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board. Safe to call on an empty DB."""
+    """``{status: count}`` for a board. ``{}`` only for a board with no DB yet.
+
+    An unreadable board — a DB that exists but cannot serve ``tasks`` — raises
+    instead of returning ``{}``: "this board is broken" and "this board has no
+    cards" must never render identically (see ``KanbanDbHuskError``).
+    """
+    if not kb.kanban_db_path(board=slug).exists():
+        return {}
     try:
-        if not kb.kanban_db_path(board=slug).exists():
-            return {}
         with kbc.connect_closing(board=slug) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise RuntimeError(f"board {slug!r} is unreadable: {exc}") from exc
 
 
 def _board_slug_arg(args: argparse.Namespace, cmd: str, *, must_exist: bool) -> tuple[Optional[str], int]:
@@ -53,7 +58,13 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     current = kb.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_task_counts(b["slug"])
+        # One broken board must not hide the other seven: keep the error on the
+        # row and print it where the counts would have gone.
+        try:
+            b["counts"] = _board_task_counts(b["slug"])
+            b["counts_error"] = None
+        except RuntimeError as exc:
+            b["counts"], b["counts_error"] = {}, str(exc)
         b["total"] = sum(b["counts"].values())
     if _json_out(args, boards):
         return 0
@@ -64,7 +75,9 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     for b in boards:
         marker = "●" if b["is_current"] else " "
         name = (b.get("name") or "") + (" [archived]" if b.get("archived") else "")
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {_fmt_counts(b['counts'] or {}, '(empty)')}")
+        counts = (_fmt_counts(b["counts"], "(empty)") if not b.get("counts_error")
+                  else f"UNREADABLE ({b['counts_error']})")
+        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts}")
     print(f"\nCurrent board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
