@@ -205,6 +205,24 @@ def _profile_author() -> str:
     return current_profile_name("user") or "user"
 
 
+def _persisted_active_board() -> str:
+    """The board a human sees with no ``--board``: the ``current`` pointer.
+
+    Deliberately ignores the scoped ``--board`` override that
+    :func:`kanban_db.get_current_board` honours, so a create can compare "where
+    did this land" against "what is on screen".
+    """
+    try:
+        f = kb.current_board_path()
+        raw = f.read_text(encoding="utf-8-sig").strip() if f.exists() else ""
+    except OSError:
+        return kb.DEFAULT_BOARD
+    try:
+        return kb._normalize_board_slug(raw) or kb.DEFAULT_BOARD
+    except ValueError:
+        return kb.DEFAULT_BOARD
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
@@ -360,6 +378,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    write_board = kb.get_current_board()
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
@@ -382,7 +401,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'}, board={write_board})")
+        # A card filed onto a board the human is not looking at is the failure this
+        # card exists for: it is durable, `show` finds it, and the board view never
+        # lists it. Say where it went instead of letting it look vanished.
+        active_board = _persisted_active_board()
+        if write_board != active_board:
+            print(f"\n⚠  filed on board {write_board!r} ({kb.kanban_db_path(board=write_board)}), "
+                  f"but the active board is {active_board!r}. "
+                  f"`hermes kanban boards switch {write_board}` to see it.", file=sys.stderr)
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
         if task.status == "ready" and task.assignee:

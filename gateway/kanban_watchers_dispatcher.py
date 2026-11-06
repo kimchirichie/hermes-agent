@@ -155,7 +155,10 @@ class _KanbanDispatcher:
         return (resolved, stat.st_mtime_ns, stat.st_size)
 
     def is_corrupt_board_db_error(self, exc: Exception) -> bool:
-        if isinstance(exc, _kbc().KanbanDbCorruptError):
+        # A schema-less husk is the same operator problem as corruption: the
+        # board must not be dispatched into until a human decides, and the
+        # fingerprint/quarantine below lifts as soon as the file changes.
+        if isinstance(exc, (_kbc().KanbanDbCorruptError, _kbc().KanbanDbHuskError)):
             return True
         return isinstance(exc, sqlite3.DatabaseError) and any(m in str(exc).lower() for m in _CORRUPT_DB_MARKERS)
 
@@ -201,12 +204,12 @@ class _KanbanDispatcher:
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
                 logger.error(
-                    "kanban dispatcher: board %s database %s is not a valid "
-                    "SQLite database; pausing dispatch for this board until "
-                    "the file changes, the gateway restarts, or the "
-                    "quarantine timer expires. Move or restore the file, "
-                    "then run `hermes kanban init` if you need a fresh board.",
-                    slug, fingerprint[0],
+                    "kanban dispatcher: board %s database %s cannot be opened (%s); "
+                    "pausing dispatch for this board until the file changes, the "
+                    "gateway restarts, or the quarantine timer expires. Move or "
+                    "restore the file, then run `hermes kanban init` if you need a "
+                    "fresh board.",
+                    slug, fingerprint[0], exc,
                 )
                 return None
             logger.exception("kanban dispatcher: tick failed on board %s", slug)

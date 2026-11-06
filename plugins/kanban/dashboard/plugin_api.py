@@ -1366,16 +1366,21 @@ def _projects_by_id() -> dict[str, Any]:
         return {}
 
 
-def _board_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board; ``{}`` on a missing/empty DB."""
+def _board_counts(slug: str) -> tuple[dict[str, int], Optional[str]]:
+    """``({status: count}, error)`` for a board. ``({}, None)`` when it has no DB yet.
+
+    A board whose DB cannot serve ``tasks`` returns its error instead of a bare
+    ``{}``, so the switcher can say "unreadable" rather than badge a broken
+    board as empty (see ``KanbanDbHuskError``).
+    """
+    if not kanban_db.kanban_db_path(board=slug).exists():
+        return {}, None
     try:
-        if not kanban_db.kanban_db_path(board=slug).exists():
-            return {}
         with closing(kbc.connect(board=slug)) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
-            return {r["status"]: int(r["n"]) for r in rows}
-    except Exception:
-        return {}
+            return {r["status"]: int(r["n"]) for r in rows}, None
+    except Exception as exc:
+        return {}, str(exc)
 
 
 def _default_workspace_kind(board: dict[str, Any]) -> str:
@@ -1416,7 +1421,7 @@ def list_boards(include_archived: bool = Query(False)):
     proj_map = _projects_by_id()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_counts(b["slug"])
+        b["counts"], b["counts_error"] = _board_counts(b["slug"])
         # Live cards only — archived tasks are hidden from every default board view,
         # so counting them in the switcher badge would visibly disagree.
         b["total"] = sum(n for status, n in b["counts"].items() if status != "archived")
