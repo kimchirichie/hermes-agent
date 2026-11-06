@@ -189,7 +189,7 @@ def build_worker(client, isolated_python, monkeypatch):
         pytest.fail("dependency engine ran in the caller, not the PM worker")
 
     for module, names in {
-        "pm.operations": ("build_environment", "lock_project"),
+        "pm.operations": ("build_environment", "rebuild_environment", "lock_project"),
         "pm.build_operations": ("build_requirements_environment", "export_requirements", "check_project_lock"),
     }.items():
         for name in names:

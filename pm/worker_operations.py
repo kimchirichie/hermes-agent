@@ -28,6 +28,7 @@ OPERATIONS = {
     "sync_venv": Operation("pm.install", ("venv",), "policy"),
     "venv_is_current": Operation("pm.install", ("venv",), "never"),
     "build_environment": Operation("pm.operations", ("uv",), "policy"),
+    "rebuild_environment": Operation("pm.operations", ("uv",), "policy"),
     "lock_project": Operation("pm.operations", ("uv",), "policy"),
     "ensure_environment": Operation("pm.operations", ("uv",), "policy"),
     "ensure_project_environment": Operation("pm.operations", ("uv",), "policy"),

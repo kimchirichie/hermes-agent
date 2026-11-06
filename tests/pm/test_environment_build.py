@@ -823,3 +823,90 @@ def test_no_config_drops_bridged_index_settings_from_child_env(tmp_path):
     bridged = run()
     assert bridged.returncode == 1, "default path must keep the bridge"
     assert "UV_INDEX_URL" in bridged.stderr, bridged.stderr
+
+
+def test_rebuild_swaps_a_live_destination_atomically(installable_project, tmp_path):
+    """A rebuild must never expose a missing or partial interpreter.
+
+    ``build_environment`` refuses an existing destination, so the in-place rebuild it replaced
+    began by deleting the live tree: everything resolving that path got FileNotFoundError for
+    the whole build, and a failed or killed build left nothing behind at all. A reader that is
+    already running must keep importing across the swap, and the tree it runs from must still
+    be on disk afterwards.
+    """
+    import threading
+    from pm import build_environment, rebuild_environment
+    from pm.environments import venv_python
+
+    source, _uv, env = installable_project
+    out, cache = tmp_path / "live environment", tmp_path / "cache"
+    first = build_environment(explicit=True, source=source, python=Path(sys.executable),
+                              out=out, cache=cache, env=env, offline=True)
+    assert first.is_file() and not out.is_symlink(), "a first build owns its destination outright"
+    # A process already running from the old tree: hold its interpreter open across the swap.
+    held = os.open(first, os.O_RDONLY)
+    try:
+        # First replacement migrates a real directory; it is moved aside, never deleted.
+        rebuilt = rebuild_environment(explicit=True, source=source, python=Path(sys.executable),
+                                      out=out, cache=cache, env=env, offline=True)
+        assert out.is_symlink() and rebuilt.is_file()
+        aside = list(tmp_path.glob(".live environment.old-*"))
+        assert len(aside) == 1 and (aside[0] / "pyvenv.cfg").is_file()
+        assert _run([str(aside[0] / "bin" / "python"), "-I", "-c", "import base_dep"], cwd=tmp_path,
+                    env=env) == ""
+        assert os.read(held, 1), "the open interpreter must stay readable across the swap"
+
+        # Second replacement is the hot path: one rename of a symlink, so a concurrent reader
+        # never misses. The tree it replaces stays on disk (a process may still import from it).
+        previous_generation = (out.parent / os.readlink(out)).resolve()
+        misses: list[str] = []
+        stop = threading.Event()
+
+        def read_live() -> None:
+            while not stop.is_set():
+                if not venv_python(out).is_file():
+                    misses.append(str(venv_python(out)))
+
+        reader = threading.Thread(target=read_live)
+        reader.start()
+        try:
+            latest = rebuild_environment(explicit=True, source=source, python=Path(sys.executable),
+                                        out=out, cache=cache, env=env, offline=True)
+        finally:
+            stop.set()
+            reader.join()
+        assert not misses, f"a reader lost the interpreter for {len(misses)} polls"
+        assert (out.parent / os.readlink(out)).resolve() != previous_generation
+        assert previous_generation.is_dir(), "the superseded tree must not be rmtree'd"
+        assert _run([str(latest), "-I", "-c", "import base_dep"], cwd=tmp_path, env=env) == ""
+    finally:
+        os.close(held)
+
+
+def test_failed_rebuild_leaves_the_live_environment_untouched(installable_project, tmp_path):
+    """A failed build must not cost the working environment.
+
+    The old in-place path deleted the destination before building, so any failure left the
+    install with no interpreter at all. The staged build owns only its staging tree: on failure
+    the live environment is exactly what it was, and nothing partial is published beside it.
+    """
+    from pm import build_environment, rebuild_environment
+    from pm.environments import venv_python
+    from pm.package import InstallError
+
+    source, _uv, env = installable_project
+    out, cache = tmp_path / "live environment", tmp_path / "cache"
+    build_environment(explicit=True, source=source, python=Path(sys.executable),
+                      out=out, cache=cache, env=env, offline=True)
+    live = venv_python(out)
+    live_inode = live.stat().st_ino
+    # The wheels the lock names are gone, and the replacement may not use the warm cache:
+    # the same shape as a network that dropped mid-build, which used to leave nothing at all.
+    wheels = tmp_path / "wheels"
+    wheels.rename(tmp_path / "wheels-unreachable")
+    with pytest.raises(InstallError):
+        rebuild_environment(explicit=True, source=source, python=Path(sys.executable),
+                            out=out, cache=tmp_path / "cold-cache", env=env, offline=True)
+    assert venv_python(out).stat().st_ino == live_inode, "the live tree was replaced by a failed build"
+    assert _run([str(live), "-I", "-c", "import base_dep"], cwd=tmp_path, env=env) == ""
+    assert not list(tmp_path.glob(".live environment.gen-*")), "a failed build left a staging tree"

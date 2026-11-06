@@ -64,6 +64,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--explicit", action="store_true", help="CLI builds are always explicit requests")
     parser.add_argument("--record-selection", action="store_true",
                         help="record the --extra list as this install's baseline dependency selection")
+    parser.add_argument("--replace", action="store_true",
+                        help="swap an existing --out in atomically: the previous tree is kept, "
+                             "never removed, so a failed build leaves the working one in place")
     parser.add_argument("--wheelhouse", type=Path)
     parser.add_argument("--requirements", type=Path)
     parser.add_argument("--requirement", action="append", default=[])
@@ -93,6 +96,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.manager_runtime and args.python is None:
         parser.error("--manager-runtime requires the target --python")
     _check_record_selection(parser, args, build=build, requirements=requirements)
+    if args.replace and (not build or requirements or args.manager_runtime):
+        parser.error("--replace swaps a project environment at --out: it needs --source and takes no requirements")
+    if build and not args.replace and (args.out.exists() or args.out.is_symlink()):
+        parser.error(f"--out {args.out} already exists; pass --replace to swap it in atomically")
     try:
         if args.exact_lock:
             from pm.uv_cache_prune import prune_uv_cache_to_lock
@@ -126,7 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lock=args.lock,
             )
         else:
-            executable = pm.build_environment(
+            executable = (pm.rebuild_environment if args.replace else pm.build_environment)(
                 source=args.source, out=args.out, python=args.python, cache=args.cache,
                 extras=args.extras, groups=args.groups, all_extras=args.all_extras,
                 no_install_project=args.no_install_project, frozen=not args.resolve,

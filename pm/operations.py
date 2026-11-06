@@ -5,13 +5,15 @@ Only the private environment engine knows how to obtain or invoke uv.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import uuid
 
@@ -63,6 +65,99 @@ def build_environment(
         environment.sync(source, extras=extras, groups=groups, all_extras=all_extras,
                          no_install_project=no_install_project, frozen=frozen, timeout=timeout)
     return environment.executable
+
+
+@contextmanager
+def _replacement_lock(out: Path) -> Iterator[None]:
+    """Serialize replacements of *out*. A reader never takes it: it reads old or new.
+
+    The lock covers the publish (the aside move of a legacy tree and the rename), never the
+    build: two replacements of the same destination must not interleave, while everything
+    that merely uses the environment must never wait behind a rebuild.
+    """
+    from pm.filesystem import lock_fd
+
+    lock = out.parent / f".{out.name}.replace.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+b") as mutex:
+        lock_fd(mutex.fileno(), wait=True)
+        yield
+
+
+def _verified_interpreter(generation: Path) -> Path:
+    """The staged environment's interpreter, once it proves it runs from its own tree."""
+    from pm.environments import venv_python
+
+    python = venv_python(generation)
+    if not python.is_file() or not (generation / "pyvenv.cfg").is_file():
+        raise InstallError("venv", f"the staged environment has no interpreter: {python}")
+    result = subprocess.run([str(python), "-I", "-c", "import sys; print(sys.prefix)"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            timeout=120, check=False)
+    if result.returncode or Path(result.stdout.strip() or "/").resolve() != generation.resolve():
+        # A tree whose interpreter imports from somewhere else is not the environment that
+        # was built (a torn write, or a redirect left behind): publish the previous one.
+        detail = (result.stderr or result.stdout).strip()[-300:]
+        raise InstallError("venv", f"the staged environment does not import from its own prefix: {detail}")
+    return python
+
+
+def rebuild_environment(
+    *, source: Path, out: Path, python: Path | None = None,
+    cache: Path | None = None, env: Mapping[str, str] | None = None,
+    extras: Sequence[str] = (), groups: Sequence[str] = (),
+    all_extras: bool = False, no_install_project: bool = False,
+    frozen: bool = True, sealed: bool = False, offline: bool = False,
+    explicit: bool = False, timeout: int = 1800,
+) -> Path:
+    """Replace the environment at *out*, atomically for anything that resolves that path.
+
+    ``build_environment`` refuses an existing destination, so an in-place rebuild could only
+    delete the live tree first: a failed or killed build then leaves no interpreter at all,
+    and every reader sees nothing for the whole duration of the build. This stages a complete
+    environment beside *out*, verifies it, and publishes it with one ``os.replace`` of a
+    symlink — so a reader follows either the previous tree or the replacement, never a
+    partial one — while ``_replacement_lock`` keeps two replacements from interleaving.
+
+    The previous tree is moved aside, never deleted: a process already running from it keeps
+    importing, and its path is reported so an operator (or a later gc) can reclaim it.
+    """
+    from pm.environments import venv_python
+
+    source, out = Path(source).absolute(), Path(out).absolute()
+    if not (source / "pyproject.toml").is_file():
+        raise InstallError("venv", f"project manifest is missing: {source}")
+    if frozen and not (source / "uv.lock").is_file():
+        raise InstallError("venv", f"frozen build requires a lock: {source / 'uv.lock'}")
+    _require_install_allowed(explicit)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with _replacement_lock(out):
+        generation = out.parent / f".{out.name}.gen-{uuid.uuid4().hex}"
+        try:
+            build_environment(source=source, out=generation, python=python, cache=cache, env=env,
+                              extras=extras, groups=groups, all_extras=all_extras,
+                              no_install_project=no_install_project, frozen=frozen,
+                              sealed=sealed, offline=offline, explicit=explicit, timeout=timeout)
+            _verified_interpreter(generation)
+            link = out.parent / f".{out.name}.link-{uuid.uuid4().hex}"
+            os.symlink(generation.name, link)  # relative: the replacement is its sibling
+            try:
+                if out.is_dir() and not out.is_symlink():
+                    # rename(2) cannot replace a directory, so a pre-symlink in-tree tree is
+                    # moved aside first. It is only ever moved, and only under the lock.
+                    aside = out.parent / f".{out.name}.old-{uuid.uuid4().hex}"
+                    os.replace(out, aside)
+                    os.replace(link, out)
+                    print(f"python environment: the previous tree is kept at {aside}", file=sys.stderr)
+                else:
+                    os.replace(link, out)  # atomic: replaces a symlink, a file, or nothing
+            finally:
+                link.unlink(missing_ok=True)
+        except BaseException:
+            # Only the staging tree this call created: *out* is never removed on failure.
+            shutil.rmtree(generation, ignore_errors=True)
+            raise
+    return venv_python(out)
 
 
 def lock_project(
