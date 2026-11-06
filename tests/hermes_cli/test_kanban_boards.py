@@ -525,6 +525,26 @@ class TestSchemaLessHusk:
         assert counts == {} and error is None  # no DB on disk yet: genuinely empty
 
 
+class TestOneDbPathPerSlug:
+    """Acceptance: writer and reader resolve a slug to exactly one file."""
+
+    def test_connect_opens_the_path_kanban_db_path_reports(self, fresh_home):
+        kb.create_board("agreed")
+        for slug in ("default", "agreed"):
+            path = kb.kanban_db_path(board=slug)
+            with kbc.connect_closing(board=slug) as conn:
+                opened = kbc._main_db_file(conn)
+            assert opened and Path(opened).resolve() == path.resolve(), slug
+            # The path `boards list`/the dashboard advertise is the same one.
+            assert kb.read_board_metadata(slug)["db_path"] == str(path)
+
+    def test_default_never_resolves_into_its_board_dir(self, fresh_home):
+        # boards/default/ is metadata only; a kanban.db there would be a husk
+        # nobody reads, which is the split-brain this guards against.
+        assert kb.kanban_db_path(board="default") == fresh_home / "kanban.db"
+        assert kb.board_dir("default") / "kanban.db" != kb.kanban_db_path(board="default")
+
+
 class TestCreateNamesItsBoard:
     """``create`` must say where the card landed and flag a cross-board filing."""
 
