@@ -359,13 +359,40 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
+def _boot_volume_anchor() -> Path:
+    """A directory launchd can always chdir() to and open files under."""
+    home = Path.home()
+    return home if _gw()._path_is_on_boot_volume(home) else Path("/")
+
+
+def _launchd_owned_log_dir(hermes_home: Path) -> Path:
+    """Directory for the plist's own StandardOutPath/StandardErrorPath.
+
+    launchd opens these itself, before the job runs, and macOS denies a removable volume to a
+    background job that can never answer an approval prompt — the spawn then dies EX_CONFIG 78 with
+    nothing logged at all. So when the Hermes home sits on another volume, launchd's files live on
+    the boot volume. The gateway's *process* logs (the redirect inside ProgramArguments) stay under
+    the Hermes home; this is only the pre-exec/launchd-level dump.
+    """
+    log_dir = Path(hermes_home) / "logs"
+    if _gw()._path_is_on_boot_volume(log_dir):
+        return log_dir
+    return _boot_volume_anchor() / "Library" / "Logs" / "hermes"
+
+
 def generate_launchd_plist() -> str:
     from html import escape
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
     working_dir = _gw()._stable_service_working_dir()
+    if not _gw()._path_is_on_boot_volume(working_dir):
+        # launchd chdir()s here before the job runs, and a cwd on another volume fails the spawn
+        # outright (EX_CONFIG 78) when that volume is unmounted or denied. cwd is irrelevant to the
+        # -m invocation, so any boot-volume directory is equivalent.
+        working_dir = str(_boot_volume_anchor())
     hermes_home = str(_gw().get_hermes_home().resolve())
     log_dir = _gw().get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    launchd_log_dir = _launchd_owned_log_dir(_gw().get_hermes_home())
     label = _gw().get_launchd_label()
 
     # launchd's default PATH misses Homebrew, nvm, cargo…; prepend venv/bin + node dirs (as in the
@@ -377,6 +404,11 @@ def generate_launchd_plist() -> str:
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
+    # launchd opens these before the job runs; they must be on the boot volume even when the
+    # process-level logs above are not (see _launchd_owned_log_dir).
+    launchd_log_dir.mkdir(parents=True, exist_ok=True)
+    launchd_stdout = launchd_log_dir / "gateway.log"
+    launchd_stderr = launchd_log_dir / "gateway.error.log"
     command = _timestamped_stderr_gateway_command(stderr_log, external_supervisor=True)
     prog_args_xml = "\n        ".join(
         f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
@@ -459,10 +491,10 @@ def generate_launchd_plist() -> str:
     <integer>60</integer>
 {nofile_block}
     <key>StandardOutPath</key>
-    <string>{stdout_log}</string>
+    <string>{launchd_stdout}</string>
     
     <key>StandardErrorPath</key>
-    <string>{stderr_log}</string>
+    <string>{launchd_stderr}</string>
 </dict>
 </plist>
 """

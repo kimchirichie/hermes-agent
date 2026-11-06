@@ -3066,6 +3066,31 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     return candidates
 
 
+def _path_is_on_boot_volume(path: str | Path) -> bool:
+    """Whether *path* resolves onto the volume the OS booted from.
+
+    A service definition's own paths (WorkingDirectory, StandardOutPath, StandardErrorPath) must
+    stay on the boot volume: launchd opens them and chdir()s before the job runs, and macOS denies
+    a removable volume to a background job that cannot answer an approval prompt, so the spawn dies
+    EX_CONFIG 78 with nothing logged. Any other volume can also be unmounted when the job starts.
+    Symlinks resolve first, and a path that does not exist yet is judged by its nearest existing
+    ancestor — ``~/.hermes/logs`` is on the external volume via the ``~/.hermes`` symlink even when
+    ``logs/`` has not been created.
+    """
+    probe = Path(path).expanduser()
+    try:
+        probe = probe.resolve()
+    except OSError:
+        pass
+    while True:
+        try:
+            return os.stat(probe).st_dev == os.stat("/").st_dev
+        except OSError:
+            if probe.parent == probe:  # nothing on this path resolves: no evidence, leave it alone
+                return True
+            probe = probe.parent
+
+
 def _stable_service_working_dir() -> str:
     """WorkingDirectory that won't disappear under systemd (HERMES_HOME, else PROJECT_ROOT). cwd is
     irrelevant to ``-m`` resolution, and a pinned transient checkout rots: systemd fails at CHDIR
