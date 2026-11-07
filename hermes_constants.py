@@ -80,6 +80,31 @@ def _account_home() -> Path:
         return Path(get_real_home())
 
 
+def path_is_on_boot_volume(path: str | Path) -> bool:
+    """Whether *path* resolves onto the volume the OS booted from.
+
+    A service definition's own paths (``WorkingDirectory``, ``StandardOutPath``, ``StandardErrorPath``,
+    a transient plist) must stay on the boot volume: launchd opens them and ``chdir()``s before the job
+    runs, and macOS denies a removable volume to a background job that cannot answer an approval
+    prompt, so the spawn dies EX_CONFIG 78 with nothing logged. Any other volume can also be unmounted
+    when the job starts. Symlinks resolve first, and a path that does not exist yet is judged by its
+    nearest existing ancestor — ``~/.hermes/logs`` is on the external volume via the ``~/.hermes``
+    symlink even when ``logs/`` has not been created.
+    """
+    probe = Path(path).expanduser()
+    try:
+        probe = probe.resolve()
+    except OSError:
+        pass
+    while True:
+        try:
+            return os.stat(probe).st_dev == os.stat("/").st_dev
+        except OSError:
+            if probe.parent == probe:  # nothing on this path resolves: no evidence, leave it alone
+                return True
+            probe = probe.parent
+
+
 def account_default_hermes_home() -> Path:
     """The platform default of the OS ACCOUNT, never of a foreign process ``HOME``.
 

@@ -13,10 +13,12 @@ Stdlib only, because the restart watcher imports this from a bare interpreter.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import plistlib
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -25,6 +27,15 @@ from pathlib import Path
 # supervisor declaration and every fleet scan read as "an installed, KeepAlive service".
 LABEL_PREFIX = "com.nousresearch.hermes.runtime."
 _POLL_INTERVAL_S = 0.5
+# Stand-in for anything launchd must open or chdir() to when the caller's own path is on another
+# volume. ``/private/tmp`` is on the boot volume, always exists, and is writable by the job's user.
+_BOOT_VOLUME_TEMP_ROOT = Path("/private/tmp")  # windows-footgun: ok — macOS-only module
+
+
+def _path_is_on_boot_volume(path: str | Path) -> bool:
+    """Deferred import: this module is loaded by the bare store interpreter from the restart watcher."""
+    from hermes_constants import path_is_on_boot_volume
+    return path_is_on_boot_volume(path)
 
 
 def _budget(deadline: float | None, cap: float) -> float:
@@ -103,10 +114,28 @@ def start_gateway_job(command: list[str], *, env: dict[str, str], cwd: str | Pat
     label = f"{LABEL_PREFIX}{uuid.uuid4().hex[:12]}"
     target = f"gui/{os.getuid()}/{label}"  # windows-footgun: ok — macOS-only module
     log_path = Path(log_path)
+    # launchd opens the plist itself before the job runs, and a removable volume is denied to a
+    # background job that can never answer an approval prompt: with the plist under /Volumes,
+    # `launchctl bootstrap` fails `5: Input/output error` outright (measured 2026-11-06, tccd healthy).
+    # So the plist moves to the boot volume and is unlinked again below.
+    staging: Path | None = None
+    if _path_is_on_boot_volume(log_path.parent):
+        plist_dir = log_path.parent
+    else:
+        staging = plist_dir = Path(tempfile.mkdtemp(prefix=f"hermes-{label}-", dir=_BOOT_VOLUME_TEMP_ROOT))
+    # A WorkingDirectory on /Volumes is NOT fatal on its own (same job: exit 0, `chdir` succeeded;
+    # only launchd's own file opens fail), so the caller's cwd is kept. It is only replaced when it
+    # is not a usable directory — an unmounted volume fails the spawn EX_CONFIG 78 with nothing logged.
+    working_dir: str | Path = cwd
+    try:
+        if not Path(cwd).is_dir() or not os.access(cwd, os.X_OK):
+            working_dir = _BOOT_VOLUME_TEMP_ROOT
+    except OSError:
+        working_dir = _BOOT_VOLUME_TEMP_ROOT
     # launchd stamps XPC_SERVICE_NAME=<label> on the job; the gateway must still read as the
     # unsupervised process it is, or /restart would exit for a respawn no KeepAlive provides.
     wrapped = ["/usr/bin/env", "XPC_SERVICE_NAME=0", *command]
-    plist = log_path.parent / f".{label}.plist"
+    plist = plist_dir / f".{label}.plist"
     fd = os.open(plist, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # holds the launch env
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -114,11 +143,14 @@ def start_gateway_job(command: list[str], *, env: dict[str, str], cwd: str | Pat
                 "Label": label,
                 "ProgramArguments": launchd_program_arguments(wrapped, log_path, log_path),
                 "EnvironmentVariables": dict(env),
-                "WorkingDirectory": str(cwd),
+                "WorkingDirectory": str(working_dir),
                 "RunAtLoad": True,
             }, handle)
-        done = _launchctl("bootstrap", f"gui/{os.getuid()}", str(plist),  # windows-footgun: ok — macOS-only
+        done = _launchctl("bootstrap", f"gui/{os.getuid()}", str(plist),  # windows-footgun: ok — macOS-only module
                           timeout=_budget(deadline, 10))
     finally:
         plist.unlink(missing_ok=True)
+        if staging is not None:
+            with contextlib.suppress(OSError):
+                staging.rmdir()
     return GatewayJob(target, deadline) if done is not None and done.returncode == 0 else None

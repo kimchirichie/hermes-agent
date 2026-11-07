@@ -43,6 +43,16 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
+# Boot-volume copies of the heartbeat, written alongside the canonical one whenever the Hermes home
+# is on another volume. A root LaunchDaemon cannot read a removable volume at all, and during a
+# removable-volume wedge (tccd deadlocked) nothing can read the home the canonical heartbeat sits in
+# — so the "restart the gateway from inside the gateway" CLI would have nothing to stamp into its
+# request exactly when it is needed. ``gateway-restart`` (POSIX sh, outside the home) reads these
+# same two paths in this same order: keep the two lists in step.
+_HEARTBEAT_MIRRORS = (
+    Path("/usr/local/var/hermes/state/gateway.heartbeat"),  # installer-provisioned, agent-writable
+    Path.home() / "Library" / "Application Support" / "hermes" / "state" / "gateway.heartbeat",
+)
 
 
 def _coerce_float(value: Any, default: float, floor: float = 0.0) -> float:
@@ -190,6 +200,24 @@ def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
     return _home(home).joinpath(*_HEARTBEAT_RELATIVE)
 
 
+def get_loop_heartbeat_mirror_paths(home: Optional[Path] = None) -> tuple[Path, ...]:
+    """Boot-volume copies of the heartbeat to keep in step with the canonical one.
+
+    Empty when the Hermes home is already on the boot volume: there the canonical file is readable
+    even while a removable volume is wedged, so a copy would buy nothing. A failure to judge the home
+    also yields no mirrors — a copy that may not be needed must never take the heartbeat down.
+    """
+    try:
+        from hermes_constants import path_is_on_boot_volume
+        canonical = get_loop_heartbeat_path(home)
+        if path_is_on_boot_volume(canonical):
+            return ()
+        return tuple(path for path in _HEARTBEAT_MIRRORS if path_is_on_boot_volume(path))
+    except Exception:
+        logger.debug("Could not resolve the boot-volume heartbeat mirrors", exc_info=True)
+        return ()
+
+
 def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
     """``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` — PID-suffixed so a stale node from a
     dead process is never mistaken for this gateway's witness. Served by the loop itself
@@ -228,6 +256,12 @@ def write_loop_heartbeat(
         atomic_json_write(path, payload, indent=None)
     except Exception:
         logger.debug("Failed to write gateway loop heartbeat", exc_info=True)
+    # A heartbeat that lives only on another volume is unreadable during a removable-volume wedge,
+    # which is exactly when the restart CLI has to prove the gateway is up. Keep a boot-volume copy.
+    for mirror in get_loop_heartbeat_mirror_paths(home):
+        with contextlib.suppress(Exception):
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(mirror, payload, indent=None)
     return path
 
 
