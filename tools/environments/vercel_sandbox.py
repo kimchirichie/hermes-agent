@@ -442,11 +442,21 @@ class VercelSandboxEnvironment(BaseEnvironment):
 
     @staticmethod
     def _sandbox_tags() -> dict[str, str]:
-        """Tags sent at creation: the profile id says which lane owns the box."""
+        """Tags sent at creation: the profile id says which lane owns the box, and the
+        session id lets the sweeper ask the board whether that run is still alive.
+
+        A box orphaned by a crashed or killed turn cannot be told from a working one by
+        its age, so the sweeper needs an owner handle. The Hermes session id is that
+        handle: the board records it on the run's ``owner_admitted`` event, so
+        ``task_runs.status`` + ``last_heartbeat_at`` decide liveness without guessing.
+        """
         tags = {"hermes": "sandbox"}
         profile = profile_name_for_home(get_hermes_home())
         if profile:
             tags["hermes_profile"] = profile
+        session = (os.environ.get("HERMES_SESSION_ID") or "").strip()
+        if session:
+            tags["hermes_session"] = session
         return tags
 
     def _retire_sandbox(self, sandbox: SyncSandbox | None, *, adopt_snapshot: bool = False) -> None:

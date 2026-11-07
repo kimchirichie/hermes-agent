@@ -845,11 +845,34 @@ class TestSnapshotPersistence:
 
     def test_create_sends_the_lane_tag(self, make_env, vercel_sdk, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "ms-worker"))
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
         make_env()
 
         assert vercel_sdk.create_kwargs[-1]["tags"] == {"hermes": "sandbox",
                                                        "hermes_profile": "ms-worker"}
+
+    def test_create_tags_the_session_so_the_sweeper_can_check_the_run(
+        self, make_env, vercel_sdk, monkeypatch, tmp_path
+    ):
+        """Owner handle for the sweeper: a box orphaned by a killed turn names its
+        session, and the board maps that session to the run's liveness."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "ms-worker"))
+        monkeypatch.setenv("HERMES_SESSION_ID", "local-abc123")
+
+        make_env()
+
+        assert vercel_sdk.create_kwargs[-1]["tags"] == {"hermes": "sandbox",
+                                                       "hermes_profile": "ms-worker",
+                                                       "hermes_session": "local-abc123"}
+
+    def test_blank_session_id_adds_no_tag(self, make_env, vercel_sdk, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "ms-worker"))
+        monkeypatch.setenv("HERMES_SESSION_ID", "   ")
+
+        make_env()
+
+        assert "hermes_session" not in vercel_sdk.create_kwargs[-1]["tags"]
 
     def test_persistent_cleanup_without_task_id_stops_without_snapshot(
         self, make_env, vercel_module, vercel_sdk, monkeypatch, tmp_path
