@@ -705,9 +705,20 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # What the run was ACTUALLY served (hermes_cli.kanban_model_usage.reconcile).
+    # NULL until reconciled, or when the attempt never reached an owner. A run whose
+    # served_model differs from the lane default is a fallback, which the board
+    # cannot otherwise show.
+    served_model: Optional[str] = None
+    served_class: Optional[str] = None
+    served_provider: Optional[str] = None
+    served_base_url: Optional[str] = None
+    served_mix: Optional[dict] = None
+    requested_model: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Run:
+        keys = row.keys()
         return cls(
             **{
                 col: _lossy_text(row[col]) for col in (
@@ -718,6 +729,13 @@ class Run:
             **{col: _to_epoch(row[col]) for col in ("claim_expires", "last_heartbeat_at", "ended_at")},
             id=int(row["id"]), started_at=_to_epoch(row["started_at"]) or 0,
             metadata=_json_or(_lossy_text(row["metadata"])),
+            # Pre-migration boards lack the served_* columns entirely.
+            **{col: (_lossy_text(row[col]) if col in keys else None) for col in (
+                "served_model", "served_class", "served_provider", "served_base_url",
+                "requested_model",
+            )},
+            served_mix=_json_or(_lossy_text(row["served_mix"]))
+            if "served_mix" in keys else None,
         )
 
 

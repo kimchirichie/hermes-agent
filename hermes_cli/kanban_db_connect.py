@@ -968,6 +968,19 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # What the run was ACTUALLY served (NULL = not reconciled yet, or the attempt never
+    # reached an owner). The board otherwise records only what was requested, so a run
+    # that spilled to a cloud fallback mid-session was indistinguishable from a local
+    # one. Written by hermes_cli.kanban_model_usage.reconcile from the profile's own
+    # session_model_usage rows; served_mix keeps the per-model call counts behind the
+    # dominant served_model so a mixed run stays visible.
+    ("served_model", "served_model TEXT"),
+    ("served_class", "served_class TEXT"),
+    ("served_provider", "served_provider TEXT"),
+    ("served_base_url", "served_base_url TEXT"),
+    ("served_mix", "served_mix TEXT"),
+    # tasks.model_override, else the lane profile's default at reconcile time.
+    ("requested_model", "requested_model TEXT"),
 )
 
 

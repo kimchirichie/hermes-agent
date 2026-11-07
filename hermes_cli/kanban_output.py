@@ -23,10 +23,15 @@ _TASK_DICT_FIELDS = (
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
     "metadata", "worker_pid", "started_at", "ended_at",
+    # What actually served the attempt (NULL until reconciled) — see
+    # hermes_cli.kanban_model_usage.
+    "served_model", "served_class", "served_provider", "served_base_url",
+    "served_mix", "requested_model",
 )
 _RUNS_RUN_FIELDS = (
     "id", "profile", "status", "outcome", "started_at", "ended_at",
     "summary", "error", "metadata", "worker_pid", "step_key",
+    "served_model", "served_class", "requested_model",
 )
 _ATTACHMENT_FIELDS = ("id", "filename", "content_type", "size", "uploaded_by", "stored_path", "created_at")
 

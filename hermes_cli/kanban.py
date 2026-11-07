@@ -1269,6 +1269,81 @@ def _cmd_log(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_model_usage(args: argparse.Namespace) -> int:
+    """Which model served each run: one card, a weekly local share, or the override audit."""
+    from hermes_cli import kanban_model_usage as kmu
+
+    boards = getattr(args, "boards", None)
+    task_id = getattr(args, "task_id", None)
+
+    if getattr(args, "reconcile", False):
+        # Writing the served model onto each run row is the only part of this command
+        # that touches the board; everything else is a read of the profile stores.
+        written, errors = kmu.reconcile_boards(
+            boards, since=int(time.time() - int(args.days) * 86400))
+        for err in errors:
+            print(f"kanban: reconcile failed on {err}", file=sys.stderr)
+        print(f"reconciled {written} run row(s) with their served model")
+        return 1 if errors else 0
+
+    if getattr(args, "audit", False):
+        lanes = args.lanes.split(",") if getattr(args, "lanes", None) else None
+        pins = kmu.audit_overrides(boards=boards, lanes=lanes)
+        if _json_out(args, pins):
+            return 0
+        scope = f"{', '.join(lanes)}" if lanes else "every non-reviewer lane"
+        if not pins:
+            print(f"no pins away from the lane default on {scope}")
+            return 0
+        unexplained = [p for p in pins if p["unexplained"]]
+        print(f"{len(pins)} card(s) pinned away from their lane default ({scope}), "
+              f"{len(unexplained)} with no time-sensitivity reason recorded:")
+        for p in sorted(pins, key=lambda p: (p["assignee"], p["board"], p["task_id"])):
+            flag = "UNEXPLAINED" if p["unexplained"] else f"reason={p['reason']}"
+            print(f"  {p['board']:9s} {p['task_id']}  {p['assignee']:13s} "
+                  f"{p['pinned']:26s} ({p['status']:9s}) {flag}")
+            print(f"      {p['title'][:96]}")
+        return 0
+
+    if task_id:
+        rows = kmu.attribute_boards(boards, task_id=task_id)
+        if _json_out(args, [{
+            "board": a.board, "task_id": a.task_id, "run_id": a.run_id,
+            "lane": a.assignee or a.profile, "outcome": a.outcome,
+            "session_id": a.session_id, "requested": a.requested,
+            "request_source": a.request_source,
+            "served": [vars(s) for s in a.served],
+            "model": a.model, "model_class": a.model_class,
+            "fell_back": a.fell_back, "started_at": a.started_at,
+        } for a in rows]):
+            return 0
+        if not rows:
+            print(f"(no runs recorded for {task_id})")
+            return 0
+        for a in sorted(rows, key=lambda a: a.started_at):
+            print(f"{a.board}  {a.task_id}  run {a.run_id}  lane={a.assignee or a.profile}  "
+                  f"{a.outcome or '(running)'}  {_fmt_ts(a.started_at)}")
+            print(f"  requested  {a.requested or '(unknown)'}  ({a.request_source})")
+            if not a.served:
+                reason = ("no session id on the attempt" if not a.session_id
+                          else "session not found in the profile store (pruned?)")
+                print(f"  served     (unattributed: {reason})")
+                continue
+            for s in sorted(a.served, key=lambda s: -s.calls):
+                label = f"{s.model}  [{s.model_class}]"
+                print(f"  served     {label:52s} {s.calls:5d} calls")
+            if a.fell_back:
+                print(f"  ⚠ fell back: asked for {a.requested or 'another model'}, "
+                      f"also served by {', '.join(sorted(set(a.mix) - {a.requested}))}")
+        return 0
+
+    rep = kmu.report(days=int(args.days), boards=boards)
+    if _json_out(args, rep):
+        return 0
+    print(kmu.format_report(rep))
+    return 0
+
+
 def _cmd_runs(args: argparse.Namespace) -> int:
     """Show attempt history for a task."""
     rsk, rc = _run_state_kwargs(args, "runs")
@@ -1281,14 +1356,20 @@ def _cmd_runs(args: argparse.Namespace) -> int:
     if not runs:
         print(f"(no runs yet for {args.task_id})")
         return 0
-    print(f"{'#':3s}  {'OUTCOME':12s}  {'PROFILE':16s}  {'ELAPSED':>8s}  STARTED")
+    print(f"{'#':3s}  {'OUTCOME':12s}  {'PROFILE':16s}  {'ELAPSED':>8s}  {'SERVED':22s}  STARTED")
     for i, r in enumerate(runs, 1):
         end = r.ended_at or int(time.time())
         # Clamp to 0 so NTP backward-jumps don't print negative durations.
         elapsed = max(0, end - r.started_at)
         el = f"{elapsed}s" if elapsed < 60 else f"{elapsed // 60}m" if elapsed < 3600 else f"{elapsed / 3600:.1f}h"
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
-        print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
+        # A run served by something other than what it asked for is marked, so a
+        # fallback is visible without opening the profile store.
+        served = r.served_model or "-"
+        if r.served_model and r.requested_model and r.served_model != r.requested_model:
+            served = f"{served} != {r.requested_model}"
+        print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  "
+              f"{served[:38]:22s}  {_fmt_ts(r.started_at)}")
         if r.summary:
             print(f"     → {r.summary.splitlines()[0][:100]}")
         if r.error:
@@ -1388,6 +1469,7 @@ _HANDLERS = {
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
+    "model-usage": _cmd_model_usage,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
