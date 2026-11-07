@@ -428,6 +428,25 @@ _SPECS = [
          help="Print the worker log for a task (from <kanban-root>/kanban/logs/)"),
     _cmd("runs", [_TASK_ID, _json_flag(), *_run_state_args("filter runs by task_runs column")],
          help="Show attempt history for a task (one row per run: profile, outcome, elapsed, summary)"),
+    _cmd("model-usage", [
+        _arg("--days", type=int, default=7,
+             help="Window for the local-share report in days (default 7)"),
+        _arg("--task", dest="task_id", metavar="TASK_ID",
+             help="Attribute one card's runs instead of reporting the fleet"),
+        _arg("--board", dest="boards", action="append", metavar="SLUG",
+             help="Restrict to one board (repeatable; default: every live board)"),
+        _arg("--reconcile", action="store_true",
+             help="Write each run's served model/class onto its task_runs row (idempotent; "
+                  "skips runs already attributed)"),
+        _arg("--audit", action="store_true",
+             help="List cards pinned away from their lane's default model, flagging pins "
+                  "with no time-sensitivity reason in the card"),
+        _arg("--lanes", metavar="A,B",
+             help="Comma-separated assignees for --audit (default: the worker lanes — "
+                  "reviewer lanes are pinned on purpose)"),
+        _json_flag(),
+    ], help="Which model actually served each run: per-card attribution, weekly local share, "
+            "and the model-override audit"),
     _cmd("heartbeat", [
         _TASK_ID,
         _arg("--note", help="Optional short note attached to the heartbeat event"),
