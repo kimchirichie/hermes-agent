@@ -2264,6 +2264,49 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     return not _claim_owner_is_dead(claim)
 
 
+def live_fire_claim_detail(job: Any) -> Optional[str]:
+    """Name the live ``fire_claim`` that would refuse a new fire on *job*, or None when there is
+    none.
+
+    ``claim_job_for_fire`` answers yes/no only, so callers used to report every lost claim with
+    one sentence — "already being fired by the scheduler" — for a run that is genuinely still
+    executing, for a claim owned by another host, and for a fire fence held by a process that is
+    merely finishing. That sentence reads as a wedged lock: it names no owner, no age and no
+    reason, so the reader goes looking for a file to delete. (A real session did exactly that,
+    and filed a bug against lock files that were never the guard.) The detail below is the
+    difference between a refusal you can act on and one that wastes a diagnosis.
+    """
+    claim = job.get("fire_claim") if isinstance(job, dict) else None
+    if not isinstance(claim, dict):
+        return None
+    now = _hermes_now()
+    if not _claim_is_live(claim, now, FIRE_CLAIM_TTL_SECONDS):
+        return None
+    claimed_at = _parse_aware(claim.get("at"))
+    age = max(_elapsed_seconds(now, claimed_at), 0.0) if claimed_at else 0.0
+    if age < 120:
+        age_text = f"{int(age)}s"
+    elif age < 5400:
+        age_text = f"{int(age // 60)}m"
+    else:
+        age_text = f"{age / 3600:.1f}h"
+    parts = str(claim.get("by") or "").split(":")
+    host = parts[0] or "an unknown host"
+    pid = parts[1] if len(parts) > 1 and parts[1].isdigit() else None
+    try:
+        import socket
+        same_host = host == socket.gethostname()
+    except Exception:
+        same_host = False
+    # _claim_is_live only keeps a same-host claim while its pid is alive; a foreign owner cannot
+    # be probed from here, so say that instead of asserting a liveness we cannot see.
+    if not same_host:
+        return (f"a fire started {age_text} ago is held by {host}, a different host whose "
+                f"liveness cannot be checked from here, and it has not finished")
+    owner = f"{host} (pid {pid})" if pid else host
+    return f"a fire started {age_text} ago by {owner} is still live and has not finished"
+
+
 _REARM_RECURRING_ERROR = (
     "Cannot re-arm recurring jobs: re-arm is one-shot-only; use plain resume or cron run."
 )

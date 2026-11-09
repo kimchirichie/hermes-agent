@@ -37,6 +37,7 @@ from cron.jobs import (
     get_job,
     is_job_runnable,
     list_jobs,
+    live_fire_claim_detail,
     mark_job_run,
     parse_schedule,
     pause_job,
@@ -251,7 +252,16 @@ def _claim_for_manual_run(job_id: str, log_label: str):
         elif not is_job_runnable(refreshed):
             reason = "Job is paused/disabled; resume it before running."
         else:
-            reason = "Job is already being fired by the scheduler; not run again."
+            # Name the cause: every lost claim used to read "already being fired", which is
+            # indistinguishable from a wedged lock. See live_fire_claim_detail.
+            detail = ""
+            with contextlib.suppress(Exception):
+                detail = live_fire_claim_detail(refreshed) or ""
+            if detail:
+                reason = f"Job is already being fired: {detail}. Not run again."
+            else:
+                reason = ("Job is already being fired (its fire fence is held by another process "
+                          "that has not finished; retry in a moment); not run again.")
         return None, {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for %s: %s", job_id, log_label, e)

@@ -406,3 +406,62 @@ def test_heartbeat_does_not_wait_on_the_fence_its_own_run_holds(temp_home, monke
         holder.join(timeout=5)
     assert result == {"owns": True}
     assert holder.is_alive() is False
+
+
+def test_refusal_names_the_live_claim_instead_of_the_scheduler(temp_home):
+    """A refused manual run must name WHO holds the claim and for how long.
+
+    The old one-liner ("Job is already being fired by the scheduler") was emitted for a live run,
+    for a claim owned by another host, and for a fire fence held by a finishing process alike, so
+    a correct refusal was indistinguishable from a wedged lock. A real session read it that way,
+    deleted a ``.fire-*.lock`` file (which is not the guard) and filed a bug against it.
+    """
+    import os
+    import socket
+    from datetime import timedelta
+
+    from cron.jobs import (
+        claim_job_for_fire, create_job, get_job, live_fire_claim_detail, load_jobs, save_jobs)
+    from tools import cronjob_tools
+    from tools.cronjob_tools import _claim_for_manual_run
+
+    jid = create_job(prompt="x", schedule="every 5m", name="detail")["id"]
+    assert claim_job_for_fire(jid) is True
+
+    def _set_claim(**fields):
+        jobs = load_jobs()
+        job = next(j for j in jobs if j["id"] == jid)
+        job["fire_claim"].update(fields)
+        save_jobs(jobs)
+
+    # Same-host owner whose pid is alive (this process): named, with its pid and age.
+    _set_claim(by=f"{socket.gethostname()}:{os.getpid()}:tok")
+    detail = live_fire_claim_detail(get_job(jid))
+    assert detail and "still live" in detail and f"pid {os.getpid()}" in detail
+
+    claimed, err = _claim_for_manual_run(jid, "test")
+    assert claimed is None
+    assert socket.gethostname() in err["error"] and "still live" in err["error"]
+
+    # Another host: reported as unverifiable rather than as a live pid we cannot see.
+    _set_claim(by="elsewhere:4242:tok")
+    foreign = live_fire_claim_detail(get_job(jid))
+    assert foreign and "different host" in foreign and "still live" not in foreign
+
+    # Older than the TTL is not a live claim at all (the claim is reclaimable, so nothing to name).
+    from cron.jobs import _hermes_now
+    stale_at = (_hermes_now() - timedelta(seconds=600)).isoformat()
+    _set_claim(at=stale_at, by=f"{socket.gethostname()}:{os.getpid()}:tok")
+    assert live_fire_claim_detail(get_job(jid)) is None
+
+    # No live claim recorded (the fence itself was busy): the refusal says so instead of
+    # pretending a run is in flight.
+    real_claim, real_detail = cronjob_tools.claim_job_for_fire, cronjob_tools.live_fire_claim_detail
+    cronjob_tools.claim_job_for_fire = lambda *_a, **_k: False
+    cronjob_tools.live_fire_claim_detail = lambda _job: None
+    try:
+        claimed, err = _claim_for_manual_run(jid, "test")
+    finally:
+        cronjob_tools.claim_job_for_fire = real_claim
+        cronjob_tools.live_fire_claim_detail = real_detail
+    assert claimed is None and "fire fence" in err["error"]
