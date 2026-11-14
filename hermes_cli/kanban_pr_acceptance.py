@@ -157,19 +157,58 @@ def collect_acceptance(contract: str, published_pr: str | None,
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
             # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
             legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
-            selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
-            if not selected:
+            # Selection rule: exactly one verdict per required context.
+            #
+            # `filter=latest` does NOT return one run per context — GitHub keeps every run it
+            # ever recorded for the head, so a context can carry several completed runs at the
+            # SAME head (measured on omni-pipeline #933: a re-run left a `skipped` pair beside
+            # the earlier `success`). Taking the worst of all of them let a `skipped` re-run
+            # poison a green `success` and read `infra` on a merged, fully-passing PR.
+            #
+            #  1. `skipped` is not evidence about this head. GitHub sets it when the workflow
+            #     itself declined to run the job (`if:`, path/branch filters), so it says
+            #     nothing about whether the code passed — and a re-run that supersedes an
+            #     earlier attempt must not erase that attempt's verdict.
+            #  2. Among the runs that DID execute, the highest id wins: a re-run supersedes its
+            #     predecessor, so the newest completed attempt is the verdict — the same thing
+            #     a human reads on the PR page. An older failure is therefore cleared by a
+            #     newer pass, and a newer failure is never masked by an older pass.
+            #  3. A legacy commit status is separate evidence, not a re-run of a check-run, so
+            #     it is kept alongside the newest run and the worse of the two decides. A stale
+            #     legacy pass cannot cover a newer failing run, and a skipped duplicate cannot
+            #     discard a legacy pass.
+            executed = [r for r in matching if r["conclusion"] != "skipped"]
+            verdict_run = max(executed, key=lambda r: r["id"]) if executed else None
+            skipped_ids = sorted(r["id"] for r in matching if r["conclusion"] == "skipped")
+            newest_legacy = max(legacy, key=lambda s: s["id"]) if legacy else None
+            evidence = ([verdict_run] if verdict_run else []) + ([newest_legacy] if newest_legacy else [])
+            if not evidence:
+                # Nothing ran for this required context at this head. That is no evidence, not
+                # an infrastructure failure: `missing` keeps the gate strict without blaming
+                # GitHub for a job the workflow chose not to run.
                 outcomes.append("missing")
-                receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
-            for check in selected:
+                named = max(matching, key=lambda r: r["id"]) if matching else None
+                receipt["checks"].append({"name": context, "id": named["id"] if named else None,
+                    "url": (named.get("html_url") or named.get("target_url")) if named else None,
+                    "head_sha": sha, "classification": "missing",
+                    "conclusion": named.get("conclusion") if named else None,
+                    "skipped_runs": skipped_ids})
+                continue
+            classified = []
+            for check in evidence:
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
-                classification = _classify(check, sha, outcome, is_run)
-                outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
-                    "url": check.get("html_url") or check.get("target_url"),
-                    "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                classified.append((check, outcome, _classify(check, sha, outcome, is_run)))
+            outcomes.extend(classification for _, _, classification in classified)
+            # Name the evidence the verdict rests on (the failing/newest check), so a receipt
+            # never reads as a failure that points at a run which did not decide it.
+            check, outcome, classification = next(
+                ((c, o, k) for c, o, k in classified if k != "success"), classified[0])
+            receipt["checks"].append({"name": context, "id": check["id"],
+                "url": check.get("html_url") or check.get("target_url"),
+                "head_sha": check.get("head_sha", check.get("sha")),
+                "classification": classification, "conclusion": outcome,
+                "skipped_runs": skipped_ids})
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
@@ -195,4 +234,8 @@ def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
         return "stale"
     if is_run and check.get("status") != "completed":
         return "pending"
+    # `skipped` is explicit: the job did not run, so it is no evidence about this head.
+    # It must never fall through to the default below, which means "GitHub itself failed".
+    if outcome == "skipped":
+        return "missing"
     return {"success": "success", "failure": "failure", "error": "infra", "pending": "pending"}.get(outcome, "infra")
