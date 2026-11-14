@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -387,3 +388,69 @@ def test_mint_is_fenced_by_the_configured_repo_allow_list(tmp_path, monkeypatch)
     assert kpa._mint_ci_token(str(assignee_home), "acme/repo") == "ghs_x"
     # ...and a sibling repo stays outside.
     assert kpa._mint_ci_token(str(assignee_home), "acme/other") is None
+
+
+@pytest.mark.platforms("posix")
+def test_minted_token_expiry_is_read_as_utc_not_local_time(tmp_path, monkeypatch):
+    """GitHub's `expires_at` is UTC. Parsing it with `time.mktime` (which reads a struct_time as
+    LOCAL) cached a dead token for the host's UTC offset — 8h on a PST host — so every completion
+    in that window reused an expired token and read `auth`. This drives the REAL
+    `_installation_token` parser and asserts the returned expiry equals the UTC instant."""
+    import calendar
+    import urllib.request
+
+    from hermes_cli import kanban_pr_acceptance as kpa
+
+    expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    expected = float(calendar.timegm(time.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ")))
+
+    class FakeJwt:
+        @staticmethod
+        def encode(payload, key, algorithm):
+            return "signed-jwt"
+
+    class FakeResponse:
+        status = 201
+
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps({"token": "ghs_tz", "expires_at": expires_at}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    key = tmp_path / "key.pem"
+    key.write_text("key", encoding="utf-8")
+    creds = {"GITHUB_APP_ID": "1", "GITHUB_APP_PRIVATE_KEY_PATH": str(key),
+             "GITHUB_APP_INSTALLATION_ID": "99"}
+
+    # tests/conftest.py pins TZ=UTC for determinism, which HIDES this bug: mktime and timegm
+    # agree at UTC. Switch the process to a real non-UTC zone for this test, then restore.
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        assert (time.mktime(time.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ")) - expected) != 0, \
+            "this host's TZ must actually differ from UTC for the regression to bite"
+        token, expires = kpa._installation_token(creds, "acme/repo", FakeJwt)
+    finally:
+        if original_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original_tz)
+        time.tzset()
+
+    assert token == "ghs_tz"
+    assert expires == expected, "expiry must be the UTC instant, not the local-clock reading"
+    # A one-hour token must never be cached as if it expired later than ~1h from now.
+    assert expires < time.time() + 7200, "cache would outlive a 1h token"
+

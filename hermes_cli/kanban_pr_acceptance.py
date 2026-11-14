@@ -10,6 +10,7 @@ org's private repos (#122689).
 """
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import re
@@ -198,7 +199,11 @@ def _installation_token(creds: dict[str, str], repo: str, jwt_module) -> tuple[s
     if status != 201 or not body.get("token"):
         return None, 0.0
     try:
-        expires = float(time.mktime(time.strptime(body.get("expires_at", ""), "%Y-%m-%dT%H:%M:%SZ")))
+        # GitHub's `expires_at` is UTC (`2026-11-14T11:00:00Z`). `time.mktime` interprets a
+        # struct_time as LOCAL time, so on a PST host every minted token stayed cached 8h past
+        # its real expiry — the cache then handed out a dead token and the retry pass read
+        # `auth` for hours after the first mint. `calendar.timegm` is the UTC-correct inverse.
+        expires = float(calendar.timegm(time.strptime(body.get("expires_at", ""), "%Y-%m-%dT%H:%M:%SZ")))
     except (ValueError, TypeError, OverflowError):
         expires = time.time() + 3500.0  # undocumented shape: fall back to ~58 min
     return body["token"], expires
@@ -381,7 +386,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
                     f"(the profile declares no GitHub App identity, or {repo!r} is not in "
                     f"kanban.pr_acceptance.app_mint_repos)") from None
             receipt["checks"] = []  # never let a partial first pass contribute outcomes
-            return _collect(repo, number, profile_home, mint, receipt)
+            try:
+                return _collect(repo, number, profile_home, mint, receipt)
+            except _GateAuthError as second:
+                # The minted token was refused too: it is dead or was revoked. Drop it from the
+                # cache so the next completion mints a fresh one instead of reusing the corpse
+                # until its nominal expiry.
+                _CI_TOKEN_CACHE.pop((str(profile_home), repo), None)
+                raise _GateAuthError(f"{first}; a read-only ci token WAS minted for {repo} and "
+                                     f"also refused ({second})") from None
     except _GateAuthError as exc:
         login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
         receipt.update(classification="auth",
