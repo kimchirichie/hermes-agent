@@ -230,3 +230,151 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- one verdict per required context: `filter=latest` returns several runs at a head ---
+#
+# Fixture ids below are the REAL ones GitHub served for omni-pipeline #933 (head
+# d58d012a…) on 2026-11-14: a re-run (43383656911) left a `skipped` pair beside the
+# earlier passing attempt (43383286708). Taking the worst of both read `infra` on a
+# merged, fully-green PR.
+
+_SHA_933 = "d58d012aeb208b30eea15f4005776c2d966ba0d6"
+_APP_933 = 15368
+_REQUIRED_933 = [("npm run gate:ui", _APP_933), ("php artisan test", _APP_933)]
+_RUNS_933 = [
+    # required contexts: skipped re-run supersedes the earlier success
+    {"id": 131745793445, "name": "npm run gate:ui", "app": {"id": _APP_933},
+     "head_sha": _SHA_933, "status": "completed", "conclusion": "success"},
+    {"id": 131746976051, "name": "npm run gate:ui", "app": {"id": _APP_933},
+     "head_sha": _SHA_933, "status": "completed", "conclusion": "skipped"},
+    {"id": 131745793128, "name": "php artisan test", "app": {"id": _APP_933},
+     "head_sha": _SHA_933, "status": "completed", "conclusion": "success"},
+    {"id": 131747025300, "name": "php artisan test", "app": {"id": _APP_933},
+     "head_sha": _SHA_933, "status": "completed", "conclusion": "skipped"},
+    # second-order effect from the same head: non-required contexts carry the same pairs
+    {"id": 131746976326, "name": "merge approved head", "app": {"id": _APP_933},
+     "head_sha": _SHA_933, "status": "completed", "conclusion": "skipped"},
+    {"id": 131756036377, "name": "merge approved head", "app": {"id": _APP_933},
+     "head_sha": _SHA_933, "status": "completed", "conclusion": "success"},
+    {"id": 131746977254, "name": "red-main issue", "app": {"id": _APP_933},
+     "head_sha": _SHA_933, "status": "completed", "conclusion": "skipped"},
+]
+
+
+def _acceptance(monkeypatch, runs, *, required=_REQUIRED_933, statuses=(), state="MERGED",
+                sha=_SHA_933):
+    """Run ``collect_acceptance`` against a canned GitHub, no gh, no network."""
+    from hermes_cli import kanban_pr_acceptance as acc
+
+    def fake_api(endpoint, *, query=None, paginate=False, profile_home=None):
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": sha, "baseRefName": "main", "state": state}}}}
+        if "/rules/branches/" in endpoint:
+            return [[{"type": "required_status_checks", "parameters": {
+                "required_status_checks": [{"context": c, "integration_id": a} for c, a in required]}}]]
+        if "/check-runs" in endpoint:
+            return [{"total_count": len(runs), "check_runs": runs}]
+        if "/statuses" in endpoint:
+            return [list(statuses)]
+        if "/pulls/" in endpoint:
+            return {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "closed", "merged": True}
+        raise AssertionError(f"unexpected endpoint {endpoint}")
+
+    monkeypatch.setattr(acc, "_api", fake_api)
+    url = "https://github.com/acme/repo/pull/933"
+    return acc.collect_acceptance(url, url)
+
+
+def test_skipped_rerun_does_not_poison_a_green_success(monkeypatch):
+    """#933's measured shape: every required context has a `skipped` re-run at a HIGHER id
+    than its `success`. A merged, fully-passing PR must read `success`, not `infra`."""
+    receipt = _acceptance(monkeypatch, _RUNS_933)
+    assert receipt["classification"] == "success", receipt
+    assert receipt["ok"] is True
+    assert receipt["head_sha"] == _SHA_933
+    # One verdict per required context — the passing run, with the skipped re-run recorded
+    # as context rather than folded into the outcome.
+    by_name = {c["name"]: c for c in receipt["checks"]}
+    assert set(by_name) == {"npm run gate:ui", "php artisan test"}
+    assert by_name["npm run gate:ui"]["id"] == 131745793445
+    assert by_name["npm run gate:ui"]["classification"] == "success"
+    assert by_name["npm run gate:ui"]["skipped_runs"] == [131746976051]
+    assert by_name["php artisan test"]["id"] == 131745793128
+    assert by_name["php artisan test"]["classification"] == "success"
+    assert by_name["php artisan test"]["skipped_runs"] == [131747025300]
+
+
+def test_a_context_whose_only_run_is_skipped_is_missing_not_infra(monkeypatch):
+    """`skipped` means the job did not run: no evidence about this head. It must read
+    `missing` — never `infra`, which would blame GitHub for a workflow's own filter."""
+    only_skipped = [
+        {"id": 131746976051, "name": "npm run gate:ui", "app": {"id": _APP_933},
+         "head_sha": _SHA_933, "status": "completed", "conclusion": "skipped"},
+        {"id": 131745793128, "name": "php artisan test", "app": {"id": _APP_933},
+         "head_sha": _SHA_933, "status": "completed", "conclusion": "success"},
+    ]
+    receipt = _acceptance(monkeypatch, only_skipped)
+    assert receipt["classification"] == "missing", receipt
+    assert receipt["ok"] is False
+    by_name = {c["name"]: c for c in receipt["checks"]}
+    assert by_name["npm run gate:ui"]["classification"] == "missing"
+    assert by_name["npm run gate:ui"]["skipped_runs"] == [131746976051]
+    assert by_name["php artisan test"]["classification"] == "success"
+
+
+def test_newest_run_failure_wins_over_an_older_success(monkeypatch):
+    """The highest-id executed run is the verdict: a re-run that failed is never masked by
+    the pass it superseded, even on a MERGED PR."""
+    failed = [
+        {"id": 131745793445, "name": "npm run gate:ui", "app": {"id": _APP_933},
+         "head_sha": _SHA_933, "status": "completed", "conclusion": "success"},
+        {"id": 131746976051, "name": "npm run gate:ui", "app": {"id": _APP_933},
+         "head_sha": _SHA_933, "status": "completed", "conclusion": "failure"},
+        {"id": 131745793128, "name": "php artisan test", "app": {"id": _APP_933},
+         "head_sha": _SHA_933, "status": "completed", "conclusion": "success"},
+    ]
+    receipt = _acceptance(monkeypatch, failed)
+    assert receipt["classification"] == "failure", receipt
+    assert receipt["ok"] is False
+    by_name = {c["name"]: c for c in receipt["checks"]}
+    assert by_name["npm run gate:ui"]["id"] == 131746976051
+    assert by_name["npm run gate:ui"]["conclusion"] == "failure"
+
+
+def test_legacy_status_survives_a_newer_skipped_duplicate(monkeypatch):
+    """A legacy commit status is separate evidence, not a re-run of a check-run: a newer
+    `skipped` duplicate must not discard it, and a legacy failure still decides."""
+    required = [("legacy-pass", None), ("legacy-fail", None)]
+    statuses = [
+        {"id": 900, "context": "legacy-pass", "state": "success", "sha": _SHA_933},
+        {"id": 901, "context": "legacy-fail", "state": "failure", "sha": _SHA_933},
+    ]
+    runs = [
+        {"id": 131746976051, "name": "legacy-pass", "app": {"id": _APP_933},
+         "head_sha": _SHA_933, "status": "completed", "conclusion": "skipped"},
+        {"id": 131746976052, "name": "legacy-fail", "app": {"id": _APP_933},
+         "head_sha": _SHA_933, "status": "completed", "conclusion": "skipped"},
+    ]
+    receipt = _acceptance(monkeypatch, runs, required=required, statuses=statuses)
+    by_name = {c["name"]: c for c in receipt["checks"]}
+    assert by_name["legacy-pass"]["classification"] == "success"
+    assert by_name["legacy-pass"]["id"] == 900
+    assert by_name["legacy-pass"]["skipped_runs"] == [131746976051]
+    assert by_name["legacy-fail"]["classification"] == "failure"
+    assert by_name["legacy-fail"]["id"] == 901
+    assert receipt["classification"] == "failure"
+    assert receipt["ok"] is False
+
+
+def test_skipped_run_never_classifies_as_infra():
+    """The mapping is explicit, not a fallthrough: `skipped` is no evidence, while a
+    cancelled/timed-out run is still a real failure of the job."""
+    from hermes_cli.kanban_pr_acceptance import _classify
+    run = {"head_sha": _SHA_933, "status": "completed"}
+    assert _classify(run, _SHA_933, "skipped", True) == "missing"
+    assert _classify(run, _SHA_933, "success", True) == "success"
+    assert _classify(run, _SHA_933, "failure", True) == "failure"
+    assert _classify(run, _SHA_933, "cancelled", True) != "success"
+    assert _classify(run, _SHA_933, "error", True) == "infra"
