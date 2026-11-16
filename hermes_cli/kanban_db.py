@@ -1300,6 +1300,38 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                # Holding pattern (kanban.hold_profiles): a new card for a cloud lane is born
+                # `scheduled` instead of `ready`, so it waits for the 03:00 PT drain rather
+                # than claiming a sandbox the moment it is filed. Deliberately AFTER
+                # initial_task_state: a card whose parent is unfinished is `todo` (unchanged),
+                # triage/blocked are unchanged, and only a card that would have run NOW is
+                # deferred. A policy error must never cost the card — it is created `ready`
+                # exactly as before and the failure is journalled for the drain to announce.
+                hold_reason: Optional[str] = None
+                if task_status == "ready":
+                    try:
+                        from hermes_cli import kanban_hold as _hold
+
+                        hold_reason = _hold.hold_reason(
+                            assignee=assignee, priority=priority,
+                            created_by=created_by, title=title,
+                        )
+                        if hold_reason:
+                            task_status = "scheduled"
+                    except Exception as exc:
+                        _log.warning("kanban hold skipped for %r: %s", title, exc, exc_info=True)
+                        try:
+                            from hermes_cli import kanban_hold as _hold_fail
+
+                            _hold_fail.record_failure(
+                                "hold_unavailable",
+                                f"create fell through to ready: {type(exc).__name__}: {exc}",
+                                task_id=task_id,
+                            )
+                        except Exception:  # pragma: no cover - reporting is best effort
+                            pass
+                        hold_reason = None
+                        task_status = "ready"
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1352,6 +1384,11 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if hold_reason:
+                    # The marker IS the drain's permission slip; see kanban_hold.held_for_drain.
+                    from hermes_cli import kanban_hold as _hold_mark
+
+                    _hold_mark.mark_held(conn, task_id, hold_reason)
                 if claim_gate:
                     _append_event(conn, task_id, "claim_conflict", claim_gate)
                 if task_status == "blocked":
