@@ -149,7 +149,7 @@ def _mint_ci_token(profile_home: str | None, repo: str) -> str | None:
         return None  # the ambient login is not ours to widen
     if repo.lower() not in _mint_allow_list():
         return None  # outside the configured fence: fail closed, report the original refusal
-    key = (str(profile_home), repo)
+    key = (str(profile_home), repo.lower())
     cached = _CI_TOKEN_CACHE.get(key)
     if cached and time.time() < cached[1] - _CI_TOKEN_SKEW_SECONDS:
         return cached[0]
@@ -168,6 +168,28 @@ def _mint_ci_token(profile_home: str | None, repo: str) -> str | None:
         return None
     _CI_TOKEN_CACHE[key] = (token, expires_at)
     return token
+
+
+def _installation_id_for(installations: list, owner: str) -> str | None:
+    """The installation id covering *owner*, from GitHub's ``GET /app/installations``.
+
+    Defensive on purpose: a body that is off-schema is a no-mint, not an exception. A
+    missing ``id`` used to raise ``KeyError`` (reported as ``infra`` when it is really an
+    identity problem) and a non-dict entry raised ``AttributeError``, which
+    ``collect_acceptance`` does not catch — crashing ``complete_task``.
+    """
+    for entry in installations:
+        if not isinstance(entry, dict):
+            continue
+        account = entry.get("account")
+        login = account.get("login") if isinstance(account, dict) else None
+        if not isinstance(login, str) or login.lower() != owner.lower():
+            continue
+        ident = entry.get("id")
+        if ident is None or isinstance(ident, (bool, dict, list)):
+            continue
+        return str(ident)
+    return None
 
 
 def _installation_token(creds: dict[str, str], repo: str, jwt_module) -> tuple[str | None, float]:
@@ -210,13 +232,13 @@ def _installation_token(creds: dict[str, str], repo: str, jwt_module) -> tuple[s
         status, installations = call("GET", "/app/installations")
         if status != 200 or not isinstance(installations, list):
             return None, 0.0
-        installation_id = next((str(i["id"]) for i in installations
-                                if str((i.get("account") or {}).get("login", "")).lower() == owner.lower()), None)
+        installation_id = _installation_id_for(installations, owner)
         if not installation_id:
             return None, 0.0
     status, body = call("POST", f"/app/installations/{installation_id}/access_tokens",
                         {"repositories": [repo_name], "permissions": dict(_CI_PERMISSIONS)})
-    if status != 201 or not body.get("token"):
+    token = body.get("token") if isinstance(body, dict) else None
+    if status != 201 or not isinstance(token, str) or not token:
         return None, 0.0
     try:
         # GitHub's `expires_at` is UTC (`2026-11-14T11:00:00Z`). `time.mktime` interprets a
@@ -460,7 +482,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 # The minted token was refused too: it is dead or was revoked. Drop it from the
                 # cache so the next completion mints a fresh one instead of reusing the corpse
                 # until its nominal expiry.
-                _CI_TOKEN_CACHE.pop((str(profile_home), repo), None)
+                _CI_TOKEN_CACHE.pop((str(profile_home), repo.lower()), None)
                 raise _GateAuthError(f"{first}; a read-only ci token WAS minted for {repo} and "
                                      f"also refused ({second})") from None
     except _GateAuthError as exc:

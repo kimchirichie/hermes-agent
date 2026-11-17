@@ -606,6 +606,136 @@ def test_minted_token_expiry_is_read_as_utc_not_local_time(tmp_path, monkeypatch
     assert expires < time.time() + 7200, "cache would outlive a 1h token"
 
 
+# --- a GitHub body that is off-schema is a no-mint, never an exception ---
+#
+# `_installation_token` promises `(None, 0)` on ANY failure, but an off-schema body raised:
+# a missing `id` was a KeyError (which `collect_acceptance` turns into `infra`, when the real
+# problem is identity), and a non-dict installation entry or list token body was an
+# AttributeError, which `collect_acceptance` catches nowhere — so `complete_task` crashed.
+
+class _FakeJwt:
+    @staticmethod
+    def encode(payload, key, algorithm):
+        return "signed-jwt"
+
+
+class _FakeResponse:
+    def __init__(self, body, status=200):
+        self.status = status
+        self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _mint_with(monkeypatch, tmp_path, responses, creds_extra=None):
+    """Drive the REAL `_installation_token` against a canned sequence of API responses."""
+    import urllib.request
+
+    from hermes_cli import kanban_pr_acceptance as kpa
+
+    queue = list(responses)
+
+    def fake_urlopen(request, timeout=None):
+        return queue.pop(0)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    key = tmp_path / "key.pem"
+    key.write_text("key", encoding="utf-8")
+    creds = {"GITHUB_APP_ID": "1", "GITHUB_APP_PRIVATE_KEY_PATH": str(key)}
+    creds.update(creds_extra or {})
+    return kpa._installation_token(creds, "acme/repo", _FakeJwt)
+
+
+@pytest.mark.platforms("posix")
+def test_installation_entry_without_an_id_is_no_mint_not_a_keyerror(tmp_path, monkeypatch):
+    """An installation entry the App cannot identify is a no-mint. A KeyError here used to
+    surface as `infra` — a retryable blip — when the real problem is identity."""
+    token, expires = _mint_with(monkeypatch, tmp_path,
+                                [_FakeResponse([{"account": {"login": "acme"}}], status=200)])
+    assert (token, expires) == (None, 0.0)
+
+
+@pytest.mark.platforms("posix")
+def test_non_dict_installation_entry_is_no_mint_not_an_attributeerror(tmp_path, monkeypatch):
+    """`collect_acceptance` catches AttributeError nowhere, so an off-schema entry used to
+    crash `complete_task` instead of reporting the refusal."""
+    token, expires = _mint_with(monkeypatch, tmp_path,
+                                [_FakeResponse(["acme", {"account": {"login": "acme"}}], status=200)])
+    assert (token, expires) == (None, 0.0)
+
+
+@pytest.mark.platforms("posix")
+def test_list_token_body_is_no_mint_not_an_attributeerror(tmp_path, monkeypatch):
+    """A token body that is not an object cannot carry `token`: no-mint, never a crash."""
+    token, expires = _mint_with(monkeypatch, tmp_path, [_FakeResponse([], status=201)],
+                                creds_extra={"GITHUB_APP_INSTALLATION_ID": "99"})
+    assert (token, expires) == (None, 0.0)
+
+
+@pytest.mark.platforms("posix")
+def test_refused_minted_pass_drops_the_cache_entry(monkeypatch):
+    """A minted token that is refused too is dead or revoked: its cache entry must be dropped
+    so the next completion mints fresh, instead of reusing the corpse until nominal expiry.
+    The key is the lowercased repo (the URL names it in mixed case), matching the fence."""
+    from hermes_cli import kanban_pr_acceptance as acc
+
+    def refused(endpoint, *, query=None, paginate=False, profile_home=None, token=None):
+        raise acc._GateAuthError(f"HTTP 403 on {endpoint.split('?')[0]}")
+
+    monkeypatch.setattr(acc, "_api", refused)
+    monkeypatch.setattr(acc, "_mint_ci_token", lambda profile_home, repo: "ghs_stale")
+    saved = dict(acc._CI_TOKEN_CACHE)
+    acc._CI_TOKEN_CACHE.clear()
+    try:
+        key = ("None", "acme/repo")  # profile_home is None (unassigned card)
+        acc._CI_TOKEN_CACHE[key] = ("ghs_stale", time.time() + 3000)
+        url = "https://github.com/Acme/Repo/pull/933"
+        receipt = acc.collect_acceptance(url, url)
+        assert receipt["classification"] == "auth", receipt
+        assert "also refused" in receipt["detail"]
+        assert key not in acc._CI_TOKEN_CACHE, "a refused mint must not stay cached"
+    finally:
+        acc._CI_TOKEN_CACHE.clear()
+        acc._CI_TOKEN_CACHE.update(saved)
+
+
+@pytest.mark.platforms("posix")
+def test_minted_token_cache_is_shared_across_repo_casing(tmp_path, monkeypatch):
+    """GitHub repo names are case-insensitive, so the cache must be keyed on the lowercased
+    repo (the same normalisation the allow-list fence uses): a mixed-case contract must reuse
+    the token minted for the lowercase name, not mint a second one."""
+    from hermes_cli import kanban_pr_acceptance as kpa
+
+    home = str(tmp_path / "profiles" / "b")
+    monkeypatch.setattr(kpa, "_mint_allow_list", lambda: {"acme/repo"})
+    monkeypatch.setattr(kpa, "_app_credentials", lambda h: {"GITHUB_APP_ID": "1",
+        "GITHUB_APP_PRIVATE_KEY_PATH": str(tmp_path / "key.pem")})
+    monkeypatch.setitem(sys.modules, "jwt", type(sys)("jwt"))
+    mints = {"count": 0}
+
+    def fake_installation_token(creds, repo, jwt_module):
+        mints["count"] += 1
+        return "ghs_cached", time.time() + 3000
+
+    monkeypatch.setattr(kpa, "_installation_token", fake_installation_token)
+    saved = dict(kpa._CI_TOKEN_CACHE)
+    kpa._CI_TOKEN_CACHE.clear()
+    try:
+        assert kpa._mint_ci_token(home, "acme/repo") == "ghs_cached"
+        assert kpa._mint_ci_token(home, "Acme/Repo") == "ghs_cached"
+        assert mints["count"] == 1, "one repo must not be minted twice under two casings"
+    finally:
+        kpa._CI_TOKEN_CACHE.clear()
+        kpa._CI_TOKEN_CACHE.update(saved)
+
+
 # --- one verdict per required context: `filter=latest` returns several runs at a head ---
 #
 # Fixture ids below are the REAL ones GitHub served for omni-pipeline #933 (head
