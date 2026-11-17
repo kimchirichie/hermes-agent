@@ -368,6 +368,40 @@ def test_gh_env_empty_transport_var_in_assignee_env_clears_the_inherited_one(tmp
     assert "GH_TOKEN" not in env and env["GH_CONFIG_DIR"] == str(assignee_home / "gh")
 
 
+@pytest.mark.platforms("posix")
+def test_minted_token_still_goes_through_the_fail_closed_login_handling(tmp_path, monkeypatch):
+    """The mint is a fallback for a login that cannot read checks, NOT a way around the identity
+    rules: a minted token reaches gh through the same path, so the profile's own login is dropped
+    (it cannot win over the mint) and an enterprise-only or loginless profile keeps the
+    GH_CONFIG_DIR pin instead of falling through to the launcher's hosts.yml."""
+    from hermes_cli.kanban_pr_acceptance import _gh_env
+
+    launch_home = tmp_path / "home"
+    launch_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    assignee_home = launch_home / "profiles" / "b"
+    assignee_home.mkdir(parents=True)
+    monkeypatch.setenv("GH_TOKEN", "launch-token")
+
+    # (a) the profile has its own github.com login: it is dropped, the mint is the only identity.
+    (assignee_home / ".env").write_text("GH_TOKEN=profile-token\nGITHUB_TOKEN=profile-token-2\n",
+                                        encoding="utf-8")
+    env = _gh_env(str(assignee_home), "ghs_minted_read_only") or {}
+    assert env["GH_TOKEN"] == "ghs_minted_read_only"
+    assert "GITHUB_TOKEN" not in env  # would otherwise outrank the mint in gh
+    assert "profile-token" not in env.values() and "launch-token" not in env.values()
+
+    # (b) enterprise-only: no github.com login, so the pin still fires — and the mint is used,
+    #     not the launcher's hosts.yml the pin exists to exclude.
+    (assignee_home / ".env").write_text("GH_HOST=ghe.corp\nGH_ENTERPRISE_TOKEN=ghe-token\n",
+                                        encoding="utf-8")
+    env = _gh_env(str(assignee_home), "ghs_minted_read_only") or {}
+    assert env["GH_TOKEN"] == "ghs_minted_read_only"
+    assert "GH_ENTERPRISE_TOKEN" not in env and "GH_HOST" not in env
+    assert env["GH_CONFIG_DIR"] == str(assignee_home / "gh")
+    assert "ghe-token" not in env.values() and "launch-token" not in env.values()
+
+
 def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, monkeypatch):
     """A card assigned to a profile that no longer exists must not run gh as the completing
     process's ambient login: classification `auth` naming the profile, gh never invoked."""
