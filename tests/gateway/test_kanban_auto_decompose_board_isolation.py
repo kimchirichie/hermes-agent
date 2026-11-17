@@ -28,6 +28,7 @@ def _dispatcher():
 
 def test_auto_decompose_tick_leaves_process_env_untouched(monkeypatch):
     import hermes_cli
+    from hermes_cli import kanban_db as kb_db
 
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setattr(kwd, "_board_slugs", lambda kb: ["default", "personal"])
@@ -36,14 +37,14 @@ def test_auto_decompose_tick_leaves_process_env_untouched(monkeypatch):
 
     def fake_list_triage(**kw):
         seen["env"].append(os.environ.get("HERMES_KANBAN_BOARD"))
-        seen["boards"].append(kw.get("board"))
-        return ["t1"] if kw.get("board") == "personal" else []
+        seen["boards"].append(kb_db._CURRENT_BOARD_OVERRIDE.get())
+        return ["t1"] if len(seen["env"]) == 2 else []
 
     def fake_decompose(task_id, author=None, board=None):
         # Read the env at the exact moment the decomposer runs — this is the
         # window a concurrent chat turn would have been resolving through.
         seen["env"].append(os.environ.get("HERMES_KANBAN_BOARD"))
-        seen["boards"].append(board)
+        seen["boards"].append(kb_db._CURRENT_BOARD_OVERRIDE.get())
         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
 
     fake = SimpleNamespace(list_triage_ids=fake_list_triage, decompose_task=fake_decompose)
@@ -55,7 +56,7 @@ def test_auto_decompose_tick_leaves_process_env_untouched(monkeypatch):
     # The env stayed clear the whole way through.
     assert seen["env"] == [None, None, None]
     assert "HERMES_KANBAN_BOARD" not in os.environ
-    # Each board was named explicitly, and the decomposer got the board it came from.
+    # Each board is pinned for its own context only, and the decomposer sees the board it came from.
     assert seen["boards"] == ["default", "personal", "personal"]
 
 
