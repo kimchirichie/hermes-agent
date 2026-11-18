@@ -16,6 +16,7 @@ per tick, and the freshness filter that drops a ``running`` row nobody is runnin
 
 from __future__ import annotations
 
+import datetime
 import time
 from pathlib import Path
 
@@ -216,6 +217,26 @@ def test_in_flight_keeps_a_running_row_that_is_still_heartbeating(board):
     with kbc.connect_closing() as conn:
         counted = {row["id"] for row in kh.in_flight(conn, SPARK, now=now)}
     assert busy in counted
+
+
+def test_in_flight_reads_an_iso_timestamp_like_the_rest_of_the_board(board):
+    """An outside writer may store ``claim_expires`` as ISO-8601 text. ``kanban_db._to_epoch``
+    already reads that everywhere else; if ``in_flight`` disagreed, a live worker's claim would
+    look dead and the drain would release a card onto a slot that is occupied."""
+    busy = _create(title="long call, ISO claim", assignee="ms-worker", priority=9)
+    now = int(time.time())
+    future = datetime.datetime.fromtimestamp(now + 600).isoformat(timespec="seconds")
+    recent = datetime.datetime.fromtimestamp(now - 20).isoformat(timespec="seconds")
+    with kbc.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'live', claim_expires = ?, "
+            "last_heartbeat_at = ? WHERE id = ?",
+            (future, recent, busy),
+        )
+        conn.commit()
+    with kbc.connect_closing() as conn:
+        counted = {row["id"] for row in kh.in_flight(conn, SPARK, now=now)}
+    assert busy in counted, "an ISO claim_expires is a live claim, not a missing one"
 
 
 def test_ready_cards_count_even_with_no_claim(board):

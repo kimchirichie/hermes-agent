@@ -365,13 +365,18 @@ def in_flight(
 
 
 def _epoch(value: Any) -> Optional[int]:
-    """A stored epoch column as int, or ``None`` when missing/unparseable."""
+    """A stored epoch column as int, or ``None`` when missing/unparseable.
+
+    Delegates to ``kanban_db._to_epoch`` so an outside writer that stored an ISO-8601 string
+    where the schema says integer is read the same way the rest of the board reads it. A local
+    ``int(float(...))`` here would silently return ``None`` for such a row, and ``in_flight``
+    would then treat a LIVE worker's claim as dead.
+    """
     if value is None:
         return None
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
+    from hermes_cli import kanban_db as _kb
+
+    return _kb._to_epoch(value)
 
 
 # --- the drain -------------------------------------------------------------------------
