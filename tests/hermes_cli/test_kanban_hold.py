@@ -1,12 +1,17 @@
-"""The holding pattern: hold cloud-lane cards on create, release them on the nightly drain.
+"""The holding pattern: hold cloud-lane cards on create, release them when there is room.
 
 Two properties carry the whole design, and most of these tests exist to keep them true:
 
 * a held card is the ONLY thing the drain will release — ``scheduled`` is a shared column
   full of timed holds ("WAKE: ... 30-day gate", "after the snapshot limit resets"), and
-  running one of those unattended at 03:00 is the failure this feature must not introduce;
+  running one of those unattended is the failure this feature must not introduce;
 * the cap counts what is actually occupying a lane, recomputed after every release, so a
   tick can never overshoot it and a card that lands ``todo`` costs no slot.
+
+The Governor half (2026-11-18) adds the pieces the setpoint rule is built from, and those
+have their own tests at the bottom: the ONE configured number (``drain_target``), the
+population the board reading counts (``group_caps.spark.profiles``), ``limit=1`` for one card
+per tick, and the freshness filter that drops a ``running`` row nobody is running.
 """
 
 from __future__ import annotations
@@ -22,13 +27,22 @@ from hermes_cli import kanban_hold as kh
 
 CLOUD = ("ms-worker", "cs-worker", "oap-worker", "kiwii-worker",
          "ms-reviewer", "cs-reviewer", "oap-reviewer", "kiwii-reviewer", "sop-reviewer")
+#: Rick 2026-11-18: ``kanban.group_caps.spark.profiles``. Reviewers are held but run on the
+#: paid dario:opus lane, so they are deliberately NOT in this list and are not counted.
+SPARK = ("worker", "cs-worker", "kiwii-worker", "ms-worker", "oap-worker", "didi")
 
 
 def _write_config(home: Path, kanban: dict) -> None:
     """``config.yaml`` with a kanban section, written before anything loads it."""
     lines = ["kanban:"]
     for key, value in kanban.items():
-        if isinstance(value, (list, tuple)):
+        if key == "group_caps":
+            lines.append("  group_caps:")
+            for name, spec in value.items():
+                lines.append(f"    {name}:")
+                lines.append(f"      profiles: [{', '.join(spec['profiles'])}]")
+                lines.append(f"      max: {spec['max']}")
+        elif isinstance(value, (list, tuple)):
             lines.append(f"  {key}: [{', '.join(str(v) for v in value)}]")
         else:
             lines.append(f"  {key}: {value}")
@@ -47,6 +61,8 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "hold_profiles": list(CLOUD),
         "hold_exempt_priority": 8,
         "drain_cap": 4,
+        "drain_target": 3,
+        "group_caps": {"spark": {"profiles": list(SPARK), "max": 3}},
     })
     kb.init_db()
     return home
@@ -91,13 +107,130 @@ def test_a_cloud_lane_card_is_born_scheduled_and_says_why(board):
     event = _held_event(tid)
     assert event is not None, "a held card must carry a held_for_drain event"
     assert "kiwii-worker" in (event.payload or {}).get("reason", "")
+    # Rick 2026-11-18: the card waits for ROOM, not for a clock. The message must say so.
+    reason = (event.payload or {}).get("reason", "")
+    assert "03:00" not in reason, "the hold message must not promise a 03:00 drain any more"
+    assert "room" in reason
+
+
+# --- A2. the Governor's numbers ----------------------------------------------------------
+
+
+def test_the_target_is_the_one_configured_number(board):
+    """``kanban.drain_target`` is what Rick sets. The two readings are never configured."""
+    policy = kh.hold_policy()
+    assert policy.target == 3
+    assert policy.cap == 4, "the backstop ceiling is a separate, unchanged number"
+
+
+def test_the_target_defaults_to_three_when_unset(tmp_path, monkeypatch):
+    home = tmp_path / "bare"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _write_config(home, {"hold_profiles": list(CLOUD)})
+    kb.init_db()
+    assert kh.hold_policy().target == kh.DEFAULT_DRAIN_TARGET == 3
+
+
+def test_a_garbage_target_falls_back_to_three(board, monkeypatch):
+    """A config typo must not turn the setpoint into zero (which would drain nothing) or a
+    huge number (which would drain everything)."""
+    real = kh.kanban_policy_cfg()
+    monkeypatch.setattr(kh, "kanban_policy_cfg", lambda: {**real, "drain_target": "three"})
+    assert kh.hold_policy().target == 3
+
+
+def test_the_counted_population_is_the_spark_group_not_the_hold_list(board):
+    """Rick: the count is taken over ``group_caps.spark.profiles``. Reviewers are held but
+    run on dario:opus, so counting them would shut the drain on work that costs no spark."""
+    policy = kh.hold_policy()
+    assert policy.spark_profiles == frozenset(SPARK)
+    assert "ms-reviewer" in policy.profiles
+    assert "ms-reviewer" not in policy.spark_profiles
+    assert "didi" in policy.spark_profiles, "didi is a spark lane but not a held lane"
+
+
+def test_a_missing_group_config_counts_nobody(board, monkeypatch):
+    """An unreadable population is "cannot count", never "zero in flight" — the drain fails
+    closed on an empty set rather than releasing a flood."""
+    real = kh.kanban_policy_cfg()
+    monkeypatch.setattr(kh, "kanban_policy_cfg", lambda: {**real, "group_caps": None})
+    assert kh.hold_policy().spark_profiles == frozenset()
+
+
+def test_the_release_limit_releases_exactly_one_card(board):
+    """The setpoint releases ONE card per tick, oldest first, never a batch."""
+    ids = _hold_many(6)
+    with kbc.connect_closing() as conn:
+        result = kh.release_due(conn, cap=4, limit=1)
+    assert result.released == ids[:1]
+    assert [_status(tid) for tid in ids] == ["ready"] + ["scheduled"] * 5
+
+
+def test_a_dry_run_honours_the_limit_too(board):
+    ids = _hold_many(4)
+    with kbc.connect_closing() as conn:
+        result = kh.release_due(conn, cap=4, limit=1, dry_run=True)
+    assert result.released == ids[:1]
+    assert all(_status(tid) == "scheduled" for tid in ids)
+
+
+def test_in_flight_drops_a_running_row_whose_worker_is_gone(board):
+    """The board reading must drop a crashed worker's row, or one dead card would hold the
+    drain shut for the whole ``dispatch_stale_timeout_seconds``."""
+    live = _create(title="runs now", assignee="ms-worker", priority=9)
+    dead = _create(title="died mid-run", assignee="ms-worker", priority=9)
+    now = int(time.time())
+    with kbc.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'gone', claim_expires = ?, "
+            "last_heartbeat_at = ? WHERE id = ?",
+            (now - 900, now - 7200, dead),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'live', claim_expires = ?, "
+            "last_heartbeat_at = ? WHERE id = ?",
+            (now + 600, now - 30, live),
+        )
+        conn.commit()
+    with kbc.connect_closing() as conn:
+        counted = {row["id"] for row in kh.in_flight(conn, SPARK, now=now)}
+    assert live in counted, "a running card with a live claim is in flight"
+    assert dead not in counted, "a running row with a dead claim and a quiet heartbeat is not"
+
+
+def test_in_flight_keeps_a_running_row_that_is_still_heartbeating(board):
+    """A worker in one long LLM call keeps its claim expired but keeps beating: it is still
+    occupying the spark and must stay counted (the claim TTL is 15 min, an LLM call is not)."""
+    busy = _create(title="long call", assignee="ms-worker", priority=9)
+    now = int(time.time())
+    with kbc.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'live', claim_expires = ?, "
+            "last_heartbeat_at = ? WHERE id = ?",
+            (now - 120, now - 20, busy),
+        )
+        conn.commit()
+    with kbc.connect_closing() as conn:
+        counted = {row["id"] for row in kh.in_flight(conn, SPARK, now=now)}
+    assert busy in counted
+
+
+def test_ready_cards_count_even_with_no_claim(board):
+    """A ``ready`` card has no claim and no heartbeat by design; it still occupies a slot."""
+    ready = _create(title="waits for a slot", assignee="ms-worker", priority=9)
+    with kbc.connect_closing() as conn:
+        counted = {row["id"] for row in kh.in_flight(conn, SPARK)}
+    assert ready in counted
 
 
 def test_the_orchestrator_and_its_gms_keep_running_live(board):
     """Rick: hold ONLY the cloud lanes. Mumu, the GMs and the local lanes run live."""
     for lane in ("mumu", "ani", "sarah", "gm-cs", "gm-ms", "gm-oap", "gm-kiwii",
                  "didi", "mockup", "worker", "reviewer"):
-        tid = _create(title=f"{lane} work that must not wait for 03:00", assignee=lane)
+        tid = _create(title=f"{lane} work that must not wait for a slot", assignee=lane)
         assert _status(tid) == "ready", lane
         assert _held_event(tid) is None, lane
 
@@ -109,7 +242,7 @@ def test_every_cloud_lane_is_held(board):
 
 
 def test_an_urgent_priority_escapes_the_hold(board):
-    """Guard (ii): `--priority 8` means "run now", not "run at 03:00"."""
+    """Guard (ii): `--priority 8` means "run now", not "wait for room"."""
     urgent = _create(title="Cloud lane emergency", assignee="ms-worker", priority=8)
     normal = _create(title="Cloud lane routine", assignee="ms-worker", priority=7)
     assert _status(urgent) == "ready"
