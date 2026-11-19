@@ -90,6 +90,25 @@ class TestSessionCreation:
         assert voice_live.resolve_gpt_live_status()["available"] is False
 
 
+class TestProgressWordsAreEarned:
+    """Doctrine 48: the voice may not claim progress on its own. Only the app's labelled event counts."""
+
+    FORBIDDEN_CLAIMS = ("on it", "working", "still on it", "checking", "loading", "waiting",
+                        "one moment", "just a moment", "let me check", "i'll take a look",
+                        "hang on", "taking a bit longer")
+
+    def test_base_prompt_forbids_every_soft_progress_claim_and_names_the_only_signal(self):
+        text = voice_live.LIVE_PERSONA.lower()
+        for phrase in self.FORBIDDEN_CLAIMS:
+            assert phrase in text, f"the base prompt must name {phrase!r} as a forbidden claim"
+        assert "[progress]" in text
+        assert "say only \"got it.\"" in text
+        assert "say briefly that you are checking" not in text, "the old instruction told the voice to claim progress"
+
+    def test_base_prompt_stays_short_for_the_live_models_small_window(self):
+        assert len(voice_live.LIVE_PERSONA) < 2600
+
+
 class TestVoiceLiveTurnNote:
     @pytest.fixture
     def busy_session(self):
