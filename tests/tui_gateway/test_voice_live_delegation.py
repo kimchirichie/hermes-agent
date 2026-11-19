@@ -74,6 +74,7 @@ class TestSessionCreation:
         session = captured["body"]["session"]
         assert session["delegation"] == {
             "type": "client", "acknowledgement_delay_ms": voice_live.ACKNOWLEDGEMENT_DELAY_MS}
+        assert 0 <= voice_live.ACKNOWLEDGEMENT_DELAY_MS <= 800, "GPT-Live rejects acknowledgement_delay_ms above 800 with a 400"
         assert session["audio"]["output"]["voice"] == "willow"
         assert session["instructions"].endswith("Speak Spanish.")
         assert session["input"][0]["role"] == "user"

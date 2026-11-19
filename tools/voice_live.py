@@ -89,10 +89,11 @@ VOICE_LIVE_TURN_NOTE = (
     "succeeded before it did. Write no other prose between tool calls.]"
 )
 
-# Milliseconds before GPT-Live speaks its own acknowledgement of a delegation. Longer than a
-# quick answer takes, so a fast turn gets no filler. A thinking or commentary append cancels
-# every pending acknowledgement, so the renderer holds its tool-progress appends until after it.
-ACKNOWLEDGEMENT_DELAY_MS = 3_000
+# Milliseconds before GPT-Live speaks its own acknowledgement of a delegation. The API rejects
+# anything above 800 (400 "Expected a value <= 800"), so a longer wait cannot be configured
+# here. A thinking or commentary append cancels every pending acknowledgement, so the
+# renderer holds its tool-progress appends until after it.
+ACKNOWLEDGEMENT_DELAY_MS = 800
 
 
 def voice_live_turn_note(context: str = "") -> str:

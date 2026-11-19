@@ -36,7 +36,7 @@ export const MAX_SILENT_MS = 180_000
 /** The tool-label `think()` cancels every pending automatic acknowledgement in
  *  the session, so it waits until the acknowledgement had its chance. Keep in
  *  step with `ACKNOWLEDGEMENT_DELAY_MS` in tools/voice_live.py. */
-const TOOL_THINK_AFTER_MS = 4_000
+const TOOL_THINK_AFTER_MS = 1_500
 
 /** Sent to the voice model once, when the delegation shows a real progress signal. The base
  *  prompt (tools/voice_live.py LIVE_PERSONA) says this label is the only thing that counts
