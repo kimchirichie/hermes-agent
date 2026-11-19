@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_bootstrap  # imported at collection: its dependency probe reads <checkout parent>/manifest.json, which the real-home guard refuses once a test is running
+
 
 def assignment(tmp_path, monkeypatch, *, finite=True, unattended=False, yolo=False):
     from gateway.session_local import _bypass_policy

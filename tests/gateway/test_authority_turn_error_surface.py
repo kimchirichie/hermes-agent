@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_bootstrap  # imported at collection: its dependency probe reads <checkout parent>/manifest.json, which the real-home guard refuses once a test is running
+
 from gateway.config import Platform
 
 _FREE_TIER_FULL = {'free_tier': {'kind': 'at_capacity', 'message': 'The free tier is full right now.'},

@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_bootstrap  # imported at collection: its dependency probe reads <checkout parent>/manifest.json, which the real-home guard refuses once a test is running
+
 from tests.gateway.test_managed_turn_contract import assignment
 
 BASE_URL = 'https://api.minimax.io/anthropic'
@@ -82,6 +84,8 @@ def test_keyless_worker_reads_its_own_profile_home_not_the_default(tmp_path, mon
     the worker's resolution then sees its own key, never the launch (default) profile's."""
     import os
     from gateway.session_managed_worker import _worker_env
+    from tools.environments import local
+    monkeypatch.setattr(local, '_HERMES_BIN_DIR', None)  # else resolving it probes the checkout's real manifest.json
     default = tmp_path / '.hermes'
     profile = default / 'profiles' / 'kb5'
     profile.mkdir(parents=True)
