@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
-import { sanitizeTextForSpeech } from '@/lib/speech-text'
 import { type LiveHistoryMessage, type LiveTranscriptFragment, VoiceLiveSession } from '@/lib/voice-live'
+import { FAILED_LINE, NOT_CONFIRMED_LINE, parseVoiceReply } from '@/lib/voice-live-reply'
 import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -12,11 +12,36 @@ import { useComposerScope } from '../scope'
 import { micError } from './use-mic-recorder'
 import type { ConversationStatus } from './use-voice-conversation'
 
-/** How long an accepted delegation may sit before the gateway shows the turn running. */
+/** How long a sent delegation may sit before the gateway shows the turn running;
+ *  past it, with no reply either, the voice says not confirmed. */
 const SUBMIT_SETTLE_GRACE_MS = 15_000
 /** Quiet after the last user transcript fragment before the utterance is judged
  *  as a whole ("stop" ends the chat; "stop the container" is a request). */
 const UTTERANCE_SETTLE_MS = 1_500
+
+/** "Taking longer" lines: fact-free, at most one per entry, measured from the
+ *  first progress signal (the gateway showing the turn running, a tool
+ *  running, or reply text arriving), never from the send. A delegation nobody
+ *  picked up gets no such line: after SUBMIT_SETTLE_GRACE_MS of silence it is
+ *  spoken as not confirmed (module 48, "Progress words are earned"). Rick has
+ *  not named the wait yet; 8 s then 20 s is the proposed default. */
+export const WORKING_LINES: ReadonlyArray<{ afterMs: number; text: string }> = [
+  { afterMs: 8_000, text: 'Still working on it.' },
+  { afterMs: 20_000, text: 'Still on it, this one is taking a bit longer.' }
+]
+/** A running delegation may not stay silent forever: this long after its first
+ *  progress signal the voice is told it is not confirmed and the delegation
+ *  ends (a late result is then chat-only). */
+export const MAX_SILENT_MS = 180_000
+/** The tool-label `think()` cancels every pending automatic acknowledgement in
+ *  the session, so it waits until the acknowledgement had its chance. Keep in
+ *  step with `ACKNOWLEDGEMENT_DELAY_MS` in tools/voice_live.py. */
+const TOOL_THINK_AFTER_MS = 4_000
+
+/** Sent to the voice model once, when the delegation shows a real progress signal. The base
+ *  prompt (tools/voice_live.py LIVE_PERSONA) says this label is the only thing that counts
+ *  as progress. Keep the two in step. */
+export const PROGRESS_LABEL = '[progress] The request is running. Not done yet.'
 
 /** Spoken on the delegation the live model just created when the words could
  *  not reach the running turn. `think` is never read aloud, and silence lets
@@ -28,6 +53,8 @@ interface PendingVoiceResponse {
   id: string
   pending: boolean
   text: string
+  /** The user stopped the reply before it finished: its text is partial. */
+  interrupted?: boolean
 }
 
 interface VoiceLiveConversationOptions {
@@ -156,8 +183,10 @@ export function useVoiceLiveConversation({
   const userUtteranceRef = useRef('')
   const utteranceTimerRef = useRef<null | number>(null)
   const delegationRef = useRef<null | string>(null)
-  const spokenLengthRef = useRef(0)
-  const spokenResponseIdRef = useRef<null | string>(null)
+  // Delegation-keyed timers: they outlive the reply-drive effect, which tears
+  // down whenever activeDelegation, busy or status changes.
+  const workingTimersRef = useRef<number[]>([])
+  const workingArmedRef = useRef(false)
   const lastToolLabelRef = useRef<null | string>(null)
   const wasEnabledRef = useRef(enabled)
   // Last spoken correction wins: a second utterance arriving while the first
@@ -198,10 +227,26 @@ export function useVoiceLiveConversation({
     busyRef.current = busy
   }, [busy])
 
-  const setDelegation = useCallback((id: null | string) => {
-    delegationRef.current = id
-    setActiveDelegation(id)
+  const clearWorkingTimers = useCallback(() => {
+    for (const timer of workingTimersRef.current) {
+      window.clearTimeout(timer)
+    }
+
+    workingTimersRef.current = []
+    workingArmedRef.current = false
   }, [])
+
+  const setDelegation = useCallback(
+    (id: null | string) => {
+      if (id === null) {
+        clearWorkingTimers()
+      }
+
+      delegationRef.current = id
+      setActiveDelegation(id)
+    },
+    [clearWorkingTimers]
+  )
 
   const refreshStatus = useCallback(() => {
     if (!sessionRef.current) {
@@ -219,6 +264,52 @@ export function useVoiceLiveConversation({
     }
   }, [])
 
+  /** Start the "taking longer" lines and the silence cap. Called once, on the
+   *  delegation's first progress signal, never at send. They speak on whichever
+   *  delegation is current when they fire (a steer re-points it) and stop the
+   *  moment it settles. */
+  const armWorkingTimers = useCallback(
+    (session: VoiceLiveSession) => {
+      if (workingArmedRef.current) {
+        return
+      }
+
+      workingArmedRef.current = true
+      const live = () => (sessionRef.current === session ? delegationRef.current : null)
+
+      // The one labelled progress event the voice model may act on: sent once, on the same
+      // first real signal that gates the working timers (module 48, "Progress words are earned").
+      const progressId = live()
+
+      if (progressId) {
+        session.think(progressId, PROGRESS_LABEL)
+      }
+
+      workingTimersRef.current = [
+        ...WORKING_LINES.map(line =>
+          window.setTimeout(() => {
+            const id = live()
+
+            if (id) {
+              session.speak(id, line.text)
+            }
+          }, line.afterMs)
+        ),
+        window.setTimeout(() => {
+          const id = live()
+
+          if (id) {
+            session.speak(id, NOT_CONFIRMED_LINE)
+            latest.current.consumePendingResponse()
+            setDelegation(null)
+            refreshStatus()
+          }
+        }, MAX_SILENT_MS)
+      ]
+    },
+    [refreshStatus, setDelegation]
+  )
+
   const end = useCallback(async () => {
     startEpochRef.current += 1
     startingRef.current = false
@@ -232,8 +323,6 @@ export function useVoiceLiveConversation({
     const session = sessionRef.current
     sessionRef.current = null
     setDelegation(null)
-    spokenResponseIdRef.current = null
-    spokenLengthRef.current = 0
     speakingRef.current = false
     session?.close()
     setMuted(false)
@@ -286,14 +375,11 @@ export function useVoiceLiveConversation({
         // The running turn carries the correction now, so its reply answers the
         // delegation the live model is waiting on — report it under that one.
         //
-        // The spoken cursor is deliberately NOT reset: a steer seals the live
-        // bubble and the answer continues in a new one, so every word already
-        // spoken is still in the collected turn text. Restarting the cursor
-        // would say the whole running turn again; it keeps reading from where
-        // it stopped, so the user hears only the correction's tail.
+        // The working timers keep their original start: the user has already
+        // waited that long.
         setDelegation(delegationId)
         turnObservedRef.current = true
-        submittedAtRef.current = Date.now()
+        armWorkingTimers(live)
         refreshStatus()
 
         return
@@ -379,8 +465,6 @@ export function useVoiceLiveConversation({
           }
 
           setDelegation(delegationId)
-          spokenResponseIdRef.current = null
-          spokenLengthRef.current = 0
           lastToolLabelRef.current = null
           turnObservedRef.current = false
           submittedAtRef.current = Date.now()
@@ -388,7 +472,7 @@ export function useVoiceLiveConversation({
           refreshStatus()
           void Promise.resolve(latest.current.onSubmit(prompt, voiceContext)).catch(error => {
             notifyError(error, voiceCopy.liveDelegationFailed)
-            session.speak(delegationId, 'Sorry, I could not reach Hermes for that request.')
+            session.speak(delegationId, FAILED_LINE)
             setDelegation(null)
             refreshStatus()
           })
@@ -438,12 +522,13 @@ export function useVoiceLiveConversation({
       setStatus('idle')
       latest.current.onFatalError?.()
     }
-  }, [end, refreshStatus, setDelegation, voiceCopy])
+  }, [armWorkingTimers, end, refreshStatus, setDelegation, voiceCopy])
 
-  // Drive the reply back into the voice: stream commentary as Hermes writes
-  // it (sentence-chunked), quiet tool progress as thinking appends, and clear
-  // the delegation when the turn settles.
-  // eslint-disable-next-line no-restricted-syntax -- turn-coordination refs (delegation id / spoken cursor), not atom mirrors
+  // Drive the reply back into the voice. The reply is buffered: nothing of it
+  // is spoken until the turn settles, then ONE directive (see lib/voice-live-reply)
+  // is spoken. Quiet tool progress goes in as thinking appends. A delegation
+  // always ends in done, failed or not confirmed, never in silence.
+  // eslint-disable-next-line no-restricted-syntax -- turn-coordination refs (delegation id), not atom mirrors
   useEffect(() => {
     const session = sessionRef.current
     const delegationId = delegationRef.current
@@ -452,18 +537,28 @@ export function useVoiceLiveConversation({
       return undefined
     }
 
+    const settle = (text: string) => {
+      latest.current.consumePendingResponse()
+      session.speak(delegationId, text)
+      setDelegation(null)
+      refreshStatus()
+    }
+
     const tick = () => {
       if (sessionRef.current !== session || delegationRef.current !== delegationId) {
         return
       }
 
+      // Progress signal: the gateway shows the turn running. That is the
+      // acknowledgement the app already has; nothing is said before it.
       if (busyRef.current) {
         turnObservedRef.current = true
+        armWorkingTimers(session)
       }
 
       const tool = latest.current.activeToolLabel?.() ?? null
 
-      if (tool && tool !== lastToolLabelRef.current) {
+      if (tool && tool !== lastToolLabelRef.current && Date.now() - submittedAtRef.current > TOOL_THINK_AFTER_MS) {
         lastToolLabelRef.current = tool
         session.think(delegationId, `Hermes is working: ${tool}. Not done yet.`)
       }
@@ -472,35 +567,22 @@ export function useVoiceLiveConversation({
 
       if (response) {
         turnObservedRef.current = true
+        armWorkingTimers(session)
 
-        if (spokenResponseIdRef.current !== response.id) {
-          spokenResponseIdRef.current = response.id
-          spokenLengthRef.current = 0
+        if (response.pending || busyRef.current) {
+          return
         }
 
-        const spoken = sanitizeTextForSpeech(response.text)
-
-        // Append only completed sentences while streaming; the tail lands on settle.
-        if (response.pending || busyRef.current) {
-          const boundary = spoken.lastIndexOf('. ', spoken.length - 2)
-          const cut = boundary > spokenLengthRef.current ? boundary + 1 : spokenLengthRef.current
-
-          if (cut > spokenLengthRef.current) {
-            session.speak(delegationId, spoken.slice(spokenLengthRef.current, cut))
-            spokenLengthRef.current = cut
-          }
+        if (response.interrupted) {
+          settle(FAILED_LINE)
 
           return
         }
 
-        if (spoken.length > spokenLengthRef.current) {
-          session.speak(delegationId, spoken.slice(spokenLengthRef.current))
-          spokenLengthRef.current = spoken.length
-        }
+        const reply = parseVoiceReply(response.text)
 
-        latest.current.consumePendingResponse()
-        setDelegation(null)
-        refreshStatus()
+        // A directive with no words, or no directive at all, confirms nothing.
+        settle(reply.spoken ? reply.spoken : reply.kind === 'failed' ? FAILED_LINE : NOT_CONFIRMED_LINE)
 
         return
       }
@@ -511,17 +593,12 @@ export function useVoiceLiveConversation({
         !busyRef.current &&
         (turnObservedRef.current || Date.now() - submittedAtRef.current > SUBMIT_SETTLE_GRACE_MS)
       ) {
-        // Turn settled without a speakable reply (tool-only, error, interrupted).
-        // This has to be SPOKEN: `think` is never read aloud, so the live model
-        // hears nothing here and fills the silence from its own context —
-        // announcing a success Hermes never reported (MS journey 1285, the 404
-        // turn, said the update went through).
-        if (spokenLengthRef.current === 0) {
-          session.speak(delegationId, 'That did not go through.')
-        }
-
-        setDelegation(null)
-        refreshStatus()
+        // Settled with no reply text (a tool-only turn, which may well have
+        // succeeded). `think` is never read aloud and silence lets the live
+        // model announce a success Hermes never reported (MS journey 1285), so
+        // this is spoken, but as "not confirmed": only an error or a cut-off
+        // says "failed".
+        settle(NOT_CONFIRMED_LINE)
       }
     }
 
@@ -529,7 +606,7 @@ export function useVoiceLiveConversation({
     tick()
 
     return () => window.clearInterval(timer)
-  }, [activeDelegation, busy, refreshStatus, setDelegation, status])
+  }, [activeDelegation, armWorkingTimers, busy, refreshStatus, setDelegation, status])
 
   const toggleMute = useCallback(() => {
     setMuted(value => {

@@ -66,7 +66,11 @@ LIVE_PERSONA = (
     "- The user greets you, makes small talk, or asks you to repeat a result already provided.\n"
     "- You need a brief clarification to understand the request.\n\n"
     "Delegate before giving an answer that depends on backend work. Do not guess the result "
-    "while waiting; say briefly that you are checking, then wait for the result."
+    "while waiting. Any acknowledgement you give is a receipt only (\"Got it.\"): never say you "
+    "are on it, working, checking, loading or waiting unless the app has told you the work is "
+    "progressing. The only thing that counts as progress is an event labelled "
+    "\"[progress]\" from the app; a receipt, a delay or your own guess is not progress. "
+    "Then wait for the result."
 )
 
 # Per-turn note prepended to the MODEL INPUT (never the byte-stable system prompt) when a turn
@@ -74,12 +78,21 @@ LIVE_PERSONA = (
 VOICE_LIVE_TURN_NOTE = (
     "[Note: this message is a delegation from a live spoken conversation. The text is a voice "
     "transcript (it may contain mis-hearings, hesitations and later corrections; use the latest "
-    "intent). Your reply will be spoken aloud by a voice model that paraphrases it: answer in plain "
-    "conversational sentences, keep it short (a few sentences unless the user asked for detail), no "
-    "markdown, no lists, no code blocks, no URLs read out character by character. Do the work with "
-    "your tools as usual; only the final facts need to be spoken. Do not claim an action succeeded "
-    "before it actually did.]"
+    "intent). Do the work with your tools as usual. A word like check, look up or confirm is a "
+    "read: change nothing unless the latest transcript line names an action (send, close, void, "
+    "refund, edit). Your final message is the only thing the voice model hears, and it paraphrases "
+    "only the first part. Format it exactly as: a first line starting DONE:, FAILED: or NOT CONFIRMED: "
+    "followed by one or two plain sentences (no ids, hashes, links, tables or long numbers, no "
+    "markdown); then a line holding only --- ; then the detail card (ids, links, tables, "
+    "timestamps), which stays in the chat. DONE only for a result you verified. FAILED when it did "
+    "not go through. NOT CONFIRMED when you could not verify a result. Do not claim an action "
+    "succeeded before it did. Write no other prose between tool calls.]"
 )
+
+# Milliseconds before GPT-Live speaks its own acknowledgement of a delegation. Longer than a
+# quick answer takes, so a fast turn gets no filler. A thinking or commentary append cancels
+# every pending acknowledgement, so the renderer holds its tool-progress appends until after it.
+ACKNOWLEDGEMENT_DELAY_MS = 3_000
 
 
 def voice_live_turn_note(context: str = "") -> str:
@@ -171,7 +184,7 @@ def build_session_config(history: Optional[list] = None) -> dict[str, Any]:
         "model": str(live.get("model") or DEFAULT_LIVE_MODEL),
         "instructions": live_instructions(live),
         "audio": {"output": {"voice": str(live.get("voice") or DEFAULT_LIVE_VOICE)}},
-        "delegation": {"type": "client"},
+        "delegation": {"type": "client", "acknowledgement_delay_ms": ACKNOWLEDGEMENT_DELAY_MS},
     }
     if history:
         config["input"] = history

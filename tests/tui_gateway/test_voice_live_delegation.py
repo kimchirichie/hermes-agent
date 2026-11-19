@@ -72,7 +72,8 @@ class TestSessionCreation:
         assert captured["url"] == "https://api.example/v1/live/sessions"
         assert captured["auth"] == "Bearer sk-test"
         session = captured["body"]["session"]
-        assert session["delegation"] == {"type": "client"}
+        assert session["delegation"] == {
+            "type": "client", "acknowledgement_delay_ms": voice_live.ACKNOWLEDGEMENT_DELAY_MS}
         assert session["audio"]["output"]["voice"] == "willow"
         assert session["instructions"].endswith("Speak Spanish.")
         assert session["input"][0]["role"] == "user"
@@ -106,6 +107,13 @@ class TestVoiceLiveTurnNote:
         note = server._hud_surface_note(busy_session)
         assert note.startswith(voice_live.VOICE_LIVE_TURN_NOTE)
         assert "User: what's the weather" in note
+
+    def test_turn_note_carries_the_reply_contract_for_every_profile(self):
+        """One contract text for all profiles: the directives, the delimiter, the read-only rule."""
+        note = voice_live.voice_live_turn_note("User: check journey 12")
+        for needle in ("DONE:", "FAILED:", "NOT CONFIRMED:", "---", "read: change nothing"):
+            assert needle in note
+        assert note.startswith(voice_live.VOICE_LIVE_TURN_NOTE)
 
     def test_voice_context_ignored_off_the_live_surface(self, busy_session):
         server._methods["prompt.submit"](

@@ -340,6 +340,8 @@ export interface UnspokenTurnSpeech {
   id: string
   /** Whether the newest assistant bubble is still streaming. */
   pending: boolean
+  /** Whether any collected bubble was stopped by the user, so the text is partial. */
+  interrupted: boolean
   /** All unspoken assistant text in message order, bubbles joined on a blank line. */
   text: string
 }
@@ -379,6 +381,7 @@ export function collectUnspokenTurnSpeech(
 
   let id: string | null = null
   let pending = false
+  let interrupted = false
   const parts: string[] = []
 
   for (const message of messages.slice(spokenIndex + 1)) {
@@ -387,6 +390,7 @@ export function collectUnspokenTurnSpeech(
     }
 
     pending = Boolean(message.pending)
+    interrupted ||= Boolean(message.interrupted)
     const text = chatMessageText(message).trim()
 
     if (!text) {
@@ -401,7 +405,7 @@ export function collectUnspokenTurnSpeech(
     return null
   }
 
-  return { id, pending, text: parts.join('\n\n') }
+  return { id, interrupted, pending, text: parts.join('\n\n') }
 }
 
 export const normalizeWs = (value: string) => value.replace(/\s+/g, ' ').trim()

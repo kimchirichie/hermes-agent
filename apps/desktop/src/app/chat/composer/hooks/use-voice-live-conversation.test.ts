@@ -6,7 +6,7 @@ import { en } from '@/i18n/en'
 import { chunkForCommentary, toLiveHistory, type VoiceLiveHandlers } from '@/lib/voice-live'
 import { $notifications, clearNotifications } from '@/store/notifications'
 
-import { delegationPrompt, useVoiceLiveConversation } from './use-voice-live-conversation'
+import { delegationPrompt, MAX_SILENT_MS, PROGRESS_LABEL, useVoiceLiveConversation, WORKING_LINES } from './use-voice-live-conversation'
 
 // The live-voice toasts must not show machine strings — neither the wire close
 // reasons (`connection_lost`, `closed`) nor the raw `DOMException` text a denied
@@ -171,13 +171,13 @@ describe('GPT-Live delegation → Hermes turn', () => {
   })
 })
 
-// A turn that ends with nothing to say (the delegation 404s, the turn is
-// interrupted, every tool call fails) used to be reported with `think`, which
-// the live model never reads aloud — so it filled the silence itself and told
-// the user the request had succeeded (MS journey 1285, 2026-11-02). The failure
-// has to be spoken, and only when the turn did not already speak.
-describe('GPT-Live turn settling without a reply', () => {
+// Reply contract (policy module 48): the reply is buffered and ONE directive is
+// spoken on settle. "failed" is only an error or cut-off; a turn with no
+// directive is "not confirmed"; the detail card never reaches the voice.
+describe('GPT-Live reply contract', () => {
   const SETTLE_MS = 16_000
+
+  type Reply = null | { id: string; interrupted?: boolean; pending: boolean; text: string }
 
   beforeEach(() => {
     resetToasts()
@@ -190,29 +190,30 @@ describe('GPT-Live turn settling without a reply', () => {
     resetToasts()
   })
 
-  async function openLiveSession(
-    busy = false,
-    overrides: {
-      consumePendingResponse?: () => void
+  async function open(
+    options: {
+      busy?: boolean
       onSteer?: (text: string) => Promise<'queued' | 'steered' | false> | 'queued' | 'steered' | false
       onStopWord?: () => void
       onSubmit?: (text: string, voiceContext: string) => Promise<void> | void
-      pendingResponse?: () => null | { id: string; pending: boolean; text: string }
+      reply?: () => Reply
     } = {}
   ) {
+    const reply = options.reply ?? (() => null)
+
     const hook = renderHook(
       ({ isBusy }: { isBusy: boolean }) =>
         useVoiceLiveConversation({
           busy: isBusy,
-          consumePendingResponse: overrides.consumePendingResponse ?? vi.fn(),
+          consumePendingResponse: vi.fn(),
           enabled: true,
-          onSteer: overrides.onSteer,
-          onStopWord: overrides.onStopWord,
-          onSubmit: overrides.onSubmit ?? vi.fn(),
-          pendingResponse: overrides.pendingResponse ?? (() => null),
+          onSteer: options.onSteer,
+          onStopWord: options.onStopWord,
+          onSubmit: options.onSubmit ?? vi.fn(),
+          pendingResponse: reply,
           seedHistory: () => []
         }),
-      { initialProps: { isBusy: busy } }
+      { initialProps: { isBusy: options.busy ?? false } }
     )
 
     await act(async () => {
@@ -226,34 +227,212 @@ describe('GPT-Live turn settling without a reply', () => {
     }
   }
 
-  it('speaks the failure when a delegated turn settles with nothing spoken', async () => {
-    const { handlers, session } = await openLiveSession()
-
-    act(() => {
-      handlers.onDelegation('del-404', [])
+  const advance = (ms: number) =>
+    act(async () => {
+      vi.advanceTimersByTime(ms)
     })
 
-    await act(async () => {
-      vi.advanceTimersByTime(SETTLE_MS)
-    })
+  it('speaks only the directive on a done reply and keeps ids in the chat', async () => {
+    let reply: Reply = null
+    const { handlers, session } = await open({ reply: () => reply })
 
-    expect(session.speak).toHaveBeenCalledWith('del-404', 'That did not go through.')
-    // The old wording only ever reached the model as silent context.
-    expect(session.think).not.toHaveBeenCalledWith('del-404', expect.stringContaining('spoken result'))
+    act(() => handlers.onDelegation('del-ok', []))
+    reply = {
+      id: 'r1',
+      pending: false,
+      text: 'DONE: The refund is staged for your approval.\n---\nJourney 1285, order #48213, 9f3ab2c'
+    }
+    await advance(400)
+
+    const said = session.speak.mock.calls.filter(([id]) => id === 'del-ok').map(([, text]) => text)
+
+    expect(said).toEqual(['The refund is staged for your approval.'])
+    expect(said.join(' ')).not.toMatch(/1285|48213|9f3ab2c/)
   })
 
-  it('does not report a turn that already spoke its reply', async () => {
-    let response: null | { id: string; pending: boolean; text: string } = null
+  it('speaks nothing of a reply while it is still streaming, then one message on settle', async () => {
+    let reply: Reply = null
+    const { handlers, hook, session } = await open({ reply: () => reply })
 
+    act(() => handlers.onDelegation('del-buf', []))
+    await act(async () => hook.rerender({ isBusy: true }))
+    reply = { id: 'r1', pending: true, text: 'DONE: First sentence. Second sentence. Third' }
+    await advance(1_000)
+
+    expect(session.speak).not.toHaveBeenCalled()
+
+    reply = { id: 'r1', pending: false, text: 'DONE: First sentence. Second sentence.' }
+    await act(async () => hook.rerender({ isBusy: false }))
+    await advance(400)
+
+    expect(session.speak).toHaveBeenCalledTimes(1)
+    expect(session.speak).toHaveBeenCalledWith('del-buf', 'First sentence. Second sentence.')
+  })
+
+  it('never speaks raw text that has no directive, and says not confirmed', async () => {
+    let reply: Reply = null
+    const { handlers, session } = await open({ reply: () => reply })
+
+    act(() => handlers.onDelegation('del-raw', []))
+    reply = { id: 'r1', pending: false, text: 'I updated the order and it all went through fine.' }
+    await advance(400)
+
+    expect(session.speak).toHaveBeenCalledTimes(1)
+    expect(session.speak).toHaveBeenCalledWith('del-raw', 'I could not confirm that.')
+  })
+
+  it('uses the last directive, so mid-turn narration never counts', async () => {
+    let reply: Reply = null
+    const { handlers, session } = await open({ reply: () => reply })
+
+    act(() => handlers.onDelegation('del-last', []))
+    reply = { id: 'r1', pending: false, text: 'DONE: wrong early guess.\n\nFAILED: The send did not go through.\n---\ndetail' }
+    await advance(400)
+
+    expect(session.speak).toHaveBeenCalledWith('del-last', 'The send did not go through.')
+  })
+
+  it('says not confirmed, not failed, when a tool-only turn settles with no reply', async () => {
+    const { handlers, session } = await open()
+
+    act(() => handlers.onDelegation('del-tool', []))
+    await advance(SETTLE_MS)
+
+    expect(session.speak).toHaveBeenCalledWith('del-tool', 'I could not confirm that.')
+    expect(session.speak).not.toHaveBeenCalledWith('del-tool', 'That did not go through.')
+  })
+
+  it('says failed when the reply was cut off', async () => {
+    let reply: Reply = null
+    const { handlers, session } = await open({ reply: () => reply })
+
+    act(() => handlers.onDelegation('del-cut', []))
+    reply = { id: 'r1', interrupted: true, pending: false, text: 'DONE: partly writ' }
+    await advance(400)
+
+    expect(session.speak).toHaveBeenCalledWith('del-cut', 'That did not go through.')
+  })
+
+  it('says failed when the turn cannot be submitted', async () => {
+    const { handlers, session } = await open({ onSubmit: () => Promise.reject(new Error('gateway down')) })
+
+    act(() => handlers.onDelegation('del-err', []))
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(session.speak).toHaveBeenCalledWith('del-err', 'That did not go through.')
+  })
+
+  it('speaks the working lines once each, keyed to the delegation, and stops at settle', async () => {
+    let reply: Reply = null
+    const { handlers, hook, session } = await open({ reply: () => reply })
+
+    act(() => handlers.onDelegation('del-slow', []))
+    await act(async () => hook.rerender({ isBusy: true }))
+    await advance(WORKING_LINES[0].afterMs + 100)
+
+    expect(session.speak).toHaveBeenCalledWith('del-slow', WORKING_LINES[0].text)
+
+    await act(async () => hook.rerender({ isBusy: true }))
+    await advance(WORKING_LINES[1].afterMs - WORKING_LINES[0].afterMs)
+
+    expect(session.speak.mock.calls.filter(([, text]) => WORKING_LINES.some(l => l.text === text))).toHaveLength(2)
+
+    reply = { id: 'r1', pending: false, text: 'DONE: Finished.' }
+    await act(async () => hook.rerender({ isBusy: false }))
+    await advance(MAX_SILENT_MS)
+
+    expect(session.speak.mock.calls.filter(([, text]) => WORKING_LINES.some(l => l.text === text))).toHaveLength(2)
+    expect(session.speak).toHaveBeenCalledWith('del-slow', 'Finished.')
+    expect(session.speak).not.toHaveBeenCalledWith('del-slow', 'I could not confirm that.')
+  })
+
+  const isWorkingLine = ([, text]: unknown[]) => WORKING_LINES.some(l => l.text === text)
+
+  it('never speaks working for a delegation nothing picked up: no signal ends as not confirmed', async () => {
+    const { handlers, session } = await open()
+
+    act(() => handlers.onDelegation('del-dead', []))
+    await advance(WORKING_LINES[1].afterMs + 100)
+
+    expect(session.speak.mock.calls.filter(isWorkingLine)).toHaveLength(0)
+
+    await advance(SETTLE_MS)
+
+    expect(session.speak.mock.calls.filter(isWorkingLine)).toHaveLength(0)
+    expect(session.speak).toHaveBeenCalledWith('del-dead', 'I could not confirm that.')
+  })
+
+  it('never speaks working when the delegation crashes before starting', async () => {
+    const { handlers, session } = await open({ onSubmit: () => Promise.reject(new Error('crash')) })
+
+    act(() => handlers.onDelegation('del-crash', []))
+    await advance(MAX_SILENT_MS)
+
+    expect(session.speak.mock.calls.filter(isWorkingLine)).toHaveLength(0)
+    expect(session.speak).toHaveBeenCalledWith('del-crash', 'That did not go through.')
+  })
+
+  it('counts the working wait from the progress signal, not from the send', async () => {
+    const { handlers, hook, session } = await open()
+
+    act(() => handlers.onDelegation('del-late', []))
+    await advance(10_000)
+    await act(async () => hook.rerender({ isBusy: true }))
+    await advance(WORKING_LINES[0].afterMs - 1_000)
+
+    expect(session.speak.mock.calls.filter(isWorkingLine)).toHaveLength(0)
+
+    await advance(2_000)
+
+    expect(session.speak).toHaveBeenCalledWith('del-late', WORKING_LINES[0].text)
+  })
+
+  it('sends the labelled progress event once, on the first real signal, and never before it', async () => {
+    const { handlers, hook, session } = await open()
+    const isProgress = ([, text]: unknown[]) => typeof text === 'string' && text.startsWith('[progress]')
+
+    act(() => handlers.onDelegation('del-prog', []))
+    await advance(10_000)
+
+    expect(session.think.mock.calls.filter(isProgress)).toHaveLength(0)
+
+    await act(async () => hook.rerender({ isBusy: true }))
+    await act(async () => hook.rerender({ isBusy: true }))
+
+    expect(session.think.mock.calls.filter(isProgress)).toHaveLength(1)
+    expect(session.think).toHaveBeenCalledWith('del-prog', PROGRESS_LABEL)
+  })
+
+  it('never sends the progress label for a delegation nothing picked up', async () => {
+    const { handlers, session } = await open()
+
+    act(() => handlers.onDelegation('del-none', []))
+    await advance(SETTLE_MS)
+
+    expect(session.think.mock.calls.filter(([, text]) => typeof text === 'string' && text.startsWith('[progress]'))).toHaveLength(0)
+  })
+
+  it('caps the silence: a turn that never settles ends as not confirmed', async () => {
+    const { handlers, hook, session } = await open()
+
+    act(() => handlers.onDelegation('del-hang', []))
+    await act(async () => hook.rerender({ isBusy: true }))
+    await advance(MAX_SILENT_MS + 100)
+
+    expect(session.speak).toHaveBeenCalledWith('del-hang', 'I could not confirm that.')
+  })
+
+  it('holds the tool-progress think until the automatic acknowledgement has had its turn', async () => {
     const hook = renderHook(() =>
       useVoiceLiveConversation({
+        activeToolLabel: () => 'terminal',
         busy: false,
-        consumePendingResponse: () => {
-          response = null
-        },
+        consumePendingResponse: vi.fn(),
         enabled: true,
         onSubmit: vi.fn(),
-        pendingResponse: () => response,
+        pendingResponse: () => null,
         seedHistory: () => []
       })
     )
@@ -263,194 +442,52 @@ describe('GPT-Live turn settling without a reply', () => {
     })
 
     const handlers = transport.handlers.at(-1) as VoiceLiveHandlers
-    const session = transport.sessions.at(-1) as { speak: ReturnType<typeof vi.fn> }
+    const session = transport.sessions.at(-1) as { think: ReturnType<typeof vi.fn> }
 
-    act(() => {
-      handlers.onDelegation('del-ok', [])
-    })
-
-    response = { id: 'reply-1', pending: false, text: 'The update is in.' }
-
-    await act(async () => {
-      vi.advanceTimersByTime(SETTLE_MS)
-    })
-
-    expect(session.speak).toHaveBeenCalledWith('del-ok', 'The update is in.')
-    expect(session.speak).not.toHaveBeenCalledWith('del-ok', 'That did not go through.')
+    act(() => handlers.onDelegation('del-think', []))
+    await advance(1_000)
+    expect(session.think).not.toHaveBeenCalled()
+    await advance(4_000)
+    expect(session.think).toHaveBeenCalledWith('del-think', expect.stringContaining('terminal'))
   })
 
-  it('steers the running turn when the user speaks again mid-turn — it never interrupts it', async () => {
+  it('steers a talk-over into the running turn and reports under the newest delegation', async () => {
+    let reply: Reply = null
     const onSteer = vi.fn(async () => 'steered' as const)
-    const onSubmit = vi.fn()
-    const { handlers, hook, session } = await openLiveSession(false, { onSteer, onSubmit })
+    const { handlers, hook, session } = await open({ onSteer, reply: () => reply })
 
-    act(() => {
-      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
-    })
-
-    await act(async () => {
-      hook.rerender({ isBusy: true })
-    })
-
-    act(() => {
+    act(() => handlers.onDelegation('del-first', [{ endMs: 1, speaker: 'user', startMs: 0, text: 'start the import' }]))
+    await act(async () => hook.rerender({ isBusy: true }))
+    act(() =>
       handlers.onDelegation('del-second', [
-        { endMs: 2_000, speaker: 'user', startMs: 1_000, text: 'start the import' },
-        { endMs: 2_500, speaker: 'assistant', startMs: 2_000, text: 'On it.' },
-        { endMs: 3_000, speaker: 'user', startMs: 2_500, text: 'and skip the archive step' }
+        { endMs: 1, speaker: 'user', startMs: 0, text: 'start the import' },
+        { endMs: 2, speaker: 'assistant', startMs: 1, text: 'On it.' },
+        { endMs: 3, speaker: 'user', startMs: 2, text: 'and skip the archive' }
       ])
-    })
-
+    )
     await act(async () => {
       await Promise.resolve()
     })
+    reply = { id: 'r1', pending: false, text: 'DONE: Imported, archive skipped.' }
+    await act(async () => hook.rerender({ isBusy: false }))
+    await advance(400)
 
-    expect(onSteer).toHaveBeenCalledTimes(1)
-    expect(onSteer).toHaveBeenCalledWith('and skip the archive step')
-    // The correction reached the running turn: no second Hermes turn, and the
-    // old turn is not declared dead ("that request was replaced…" is gone).
-    expect(onSubmit).toHaveBeenCalledTimes(1)
-    expect(session.speak).not.toHaveBeenCalled()
-  })
-
-  it('reports the steered turn under the delegation the live model is waiting on', async () => {
-    let response: null | { id: string; pending: boolean; text: string } = null
-
-    const onSteer = vi.fn(async () => 'steered' as const)
-
-    const { handlers, hook, session } = await openLiveSession(false, {
-      consumePendingResponse: () => {
-        response = null
-      },
-      onSteer,
-      pendingResponse: () => response
-    })
-
-    act(() => {
-      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
-    })
-
-    await act(async () => {
-      hook.rerender({ isBusy: true })
-    })
-
-    act(() => {
-      handlers.onDelegation('del-second', [
-        { endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' },
-        { endMs: 1_500, speaker: 'assistant', startMs: 1_000, text: 'On it.' },
-        { endMs: 2_000, speaker: 'user', startMs: 1_500, text: 'and skip the archive step' }
-      ])
-    })
-
-    await act(async () => {
-      await Promise.resolve()
-    })
-
-    response = { id: 'reply-steered', pending: false, text: 'Imported, and the archive step was skipped.' }
-
-    await act(async () => {
-      // The steered turn settles, then its answer lands.
-      hook.rerender({ isBusy: false })
-    })
-
-    await act(async () => {
-      vi.advanceTimersByTime(1_000)
-    })
-
-    // The answer is for what the user asked LAST, so it rides the newest
-    // delegation — the one the live model is awaiting.
-    expect(session.speak).toHaveBeenCalledWith('del-second', 'Imported, and the archive step was skipped.')
+    expect(onSteer).toHaveBeenCalledWith('and skip the archive')
+    expect(session.speak).toHaveBeenCalledWith('del-second', 'Imported, archive skipped.')
     expect(session.speak).not.toHaveBeenCalledWith('del-first', expect.anything())
-  })
-
-  it('keeps reading from where it stopped after a steer — the running turn is not repeated', async () => {
-    // A steer seals the live bubble and the answer continues in a new one, so
-    // the collected turn text only GROWS (same first bubble id). Restarting the
-    // spoken cursor on the steer would say everything already spoken again.
-    let response: null | { id: string; pending: boolean; text: string } = null
-
-    const onSteer = vi.fn(async () => 'steered' as const)
-
-    const { handlers, hook, session } = await openLiveSession(false, {
-      onSteer,
-      pendingResponse: () => response
-    })
-
-    act(() => {
-      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
-    })
-
-    await act(async () => {
-      hook.rerender({ isBusy: true })
-    })
-
-    response = { id: 'bubble-1', pending: true, text: 'Reading the export now. Checking rows.' }
-
-    await act(async () => {
-      vi.advanceTimersByTime(1_000)
-    })
-
-    expect(session.speak).toHaveBeenCalledWith('del-first', 'Reading the export now.')
-
-    act(() => {
-      handlers.onDelegation('del-second', [
-        { endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' },
-        { endMs: 1_500, speaker: 'assistant', startMs: 1_000, text: 'On it.' },
-        { endMs: 2_000, speaker: 'user', startMs: 1_500, text: 'and skip the archive step' }
-      ])
-    })
-
-    await act(async () => {
-      await Promise.resolve()
-    })
-
-    response = {
-      id: 'bubble-1',
-      pending: true,
-      text: 'Reading the export now. Checking rows.\n\nThe archive step is skipped. Next up.'
-    }
-
-    await act(async () => {
-      vi.advanceTimersByTime(1_000)
-    })
-
-    const spokenAfterSteer = session.speak.mock.calls
-      .filter(([delegation]) => delegation === 'del-second')
-      .map(([, text]) => text)
-      .join(' ')
-
-    expect(spokenAfterSteer).toContain('archive step is skipped')
-    expect(spokenAfterSteer).not.toContain('Reading the export now')
   })
 
   it('queues the words and says so when a steer cannot carry them', async () => {
     const onSteer = vi.fn(async () => 'queued' as const)
-    const onSubmit = vi.fn()
-    const { handlers, hook, session } = await openLiveSession(false, { onSteer, onSubmit })
+    const { handlers, hook, session } = await open({ onSteer })
 
-    act(() => {
-      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
-    })
-
-    await act(async () => {
-      hook.rerender({ isBusy: true })
-    })
-
-    act(() => {
-      handlers.onDelegation('del-second', [
-        { endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' },
-        { endMs: 1_500, speaker: 'assistant', startMs: 1_000, text: 'On it.' },
-        { endMs: 2_000, speaker: 'user', startMs: 1_500, text: 'and skip the archive step' }
-      ])
-    })
-
+    act(() => handlers.onDelegation('del-first', [{ endMs: 1, speaker: 'user', startMs: 0, text: 'start the import' }]))
+    await act(async () => hook.rerender({ isBusy: true }))
+    act(() => handlers.onDelegation('del-second', [{ endMs: 3, speaker: 'user', startMs: 2, text: 'skip archive' }]))
     await act(async () => {
       await Promise.resolve()
     })
 
-    // The words were kept for the next turn, and the live model is told so on
-    // the delegation it awaits: silence here is what makes it invent a success.
-    expect(onSteer).toHaveBeenCalledWith('and skip the archive step')
-    expect(onSubmit).toHaveBeenCalledTimes(1)
     expect(session.speak).toHaveBeenCalledWith(
       'del-second',
       'That request is queued for right after the one already running.'
@@ -458,24 +495,14 @@ describe('GPT-Live turn settling without a reply', () => {
   })
 
   it('still ends the conversation on a spoken stop word while a turn is running', async () => {
-    const onSteer = vi.fn(async () => 'steered' as const)
     const onStopWord = vi.fn()
-    const { handlers, hook } = await openLiveSession(false, { onSteer, onStopWord })
+    const { handlers, hook } = await open({ onStopWord })
 
-    act(() => {
-      handlers.onDelegation('del-first', [{ endMs: 1_000, speaker: 'user', startMs: 0, text: 'start the import' }])
-    })
-
-    await act(async () => {
-      hook.rerender({ isBusy: true })
-    })
-
-    act(() => {
-      handlers.onDelegation('del-stop', [{ endMs: 2_000, speaker: 'user', startMs: 1_000, text: 'stop' }])
-    })
+    act(() => handlers.onDelegation('del-first', [{ endMs: 1, speaker: 'user', startMs: 0, text: 'start the import' }]))
+    await act(async () => hook.rerender({ isBusy: true }))
+    act(() => handlers.onDelegation('del-stop', [{ endMs: 2, speaker: 'user', startMs: 1, text: 'stop' }]))
 
     expect(onStopWord).toHaveBeenCalledTimes(1)
-    expect(onSteer).not.toHaveBeenCalled()
     expect(hook.result.current.status).toBe('idle')
   })
 })
