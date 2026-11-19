@@ -2,14 +2,16 @@
 
 This root file is a hub: what applies everywhere, then a routing table. Each area's `AGENTS.md`
 loads automatically when you work in that directory; read it before editing there.
-`python scripts/check` caps this file at 12k chars and every root-to-area chain at 30k: long form
+`python scripts/check` caps this file at 12k chars and each root-to-area chain at 30k: long form
 goes in `website/docs/developer-guide/`.
 
 **Never give up on the right solution.**
 
+**Branch:** work in place on `main-rick`, not `main` (stale upstream copy); never push to `origin` (NousResearch), push to `fork`. No worktrees; diff against `main-rick`.
+
 ## What Hermes Is
 
-Hermes is a personal AI agent that runs one agent core across a CLI, a TUI, an Electron desktop
+Hermes is a personal AI agent running one core across a CLI, a TUI, an Electron desktop
 app, a web dashboard, ACP editors and a messaging gateway (25+ platform plugins). It is extended
 through **plugins and skills**, not by growing the core.
 
@@ -47,7 +49,7 @@ terminal + file or a skill already does the job; `offset`/`limit` pagination on 
 change-detector tests; plugins that touch core files; third-party products in the core tree (ship a
 standalone plugin repo).
 
-**Before you call it a bug,** verify the claim AND the intent (`git log -p -S "<symbol>"`): the
+**Before you call it a bug,** verify the claim and the intent (`git log -p -S "<symbol>"`): the
 isolation is often the design (profiles are islands on purpose), an absence can be load-bearing,
 and a fix that cannot point to the line where the bug manifests has an unverified premise.
 
@@ -62,11 +64,9 @@ otherwise).
 
 ## Development Environment
 
-`source ./activate` (`activate.fish`, `activate.ps1`) provisions and activates the PM environment; pick an isolated `HERMES_HOME`/`HERMES_RUNTIME_DIR` first
-(`website/docs/reference/package-management.md#developer-workflow`). Tests need the separate test
+`source ./activate` provisions and activates the PM environment; pick an isolated `HERMES_HOME`/`HERMES_RUNTIME_DIR` first (`website/docs/reference/package-management.md`). Tests need the separate test
 environment in `CONTRIBUTING.md`. **`python scripts/check`** (`just check`) runs every blocking
-lint check CI runs, with CI's pinned tools; `--install-hook pre-push` runs it on every push (re-run
-after pulling to refresh the hook). `just` lists every developer command (lefthook calls the same
+lint check CI runs, with CI's pinned tools; `--install-hook pre-push` runs it on every push. `just` lists every developer command (lefthook calls the same
 recipes); a new command is a `scripts/` file plus a recipe. The `HX0xx`/`PS-P0x` rules and their
 fixes are in `scripts/code_health/config.py`; `# noqa` does not waive a finding,
 `# health: allow <RULE> -- <why>` does.
@@ -84,7 +84,6 @@ hermes-agent/
 ├── hermes_state.py       # SessionDB facade; hermes_state_*.py siblings
 ├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
 ├── scripts/              # check, run_tests.sh, code_health/, ci/
-├── evals/                # live-model A/B and probe harnesses
 └── website/              # Docusaurus docs (developer-guide/ holds the long-form area docs)
 ```
 
@@ -104,7 +103,7 @@ per variant and a name → variant table (`tools/environments/`, its table still
 
 - **Find code by topic:** `grep -rn "def name" <dir>/<stem>/ <dir>/<stem>_*.py`, not the facade.
 - **Imports go at module top:** topic modules import one another, never the facade; a cycle means
-  a shared name belongs in a lower module. Patch where the name is looked up.
+  a shared name belongs in a lower module.
 - **Size and complexity are ratcheted per unit:** new functions CC ≤ 20, ≤ 300 lines, nesting ≤ 6;
   files ≤ 2,000 lines; units already over may only go down (move code into `<stem>/`).
 - **Shape:** code imports on 3.11 (no PEP 695 syntax); import has no side effect but tool registration
@@ -113,7 +112,7 @@ per variant and a name → variant table (`tools/environments/`, its table still
   dispatch by table, not `if name ==` ladders; collaborators are objects, not mixins; no module
   constant kept only for tests to patch.
 - **No re-export shims for internal moves;** internal paths are not API. Moving a symbol means
-  fixing its docs in the same PR (grep `website/docs`, `skills/`, every `AGENTS.md`).
+  fixing its docs in the same PR (grep `website/docs`, `skills/`, `AGENTS.md`).
 
 ## Rules that apply everywhere
 
