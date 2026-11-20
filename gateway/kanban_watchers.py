@@ -294,9 +294,10 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                # Emergency stop (`hermes pause`): no auto-decompose or
-                # dispatch while paused; running workers finish naturally.
-                if not _kanban_dispatch_allowed():
+                # Emergency stop (`hermes pause`) or a queued restart: no auto-decompose
+                # or dispatch; running workers finish naturally. A restart waits for the
+                # gateway to go idle, so a spawn here feeds the wait it is waiting on.
+                if not _kanban_dispatch_allowed() or self._restart_requested:
                     bad_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
