@@ -43,11 +43,15 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
             "max_in_progress": 3,
             "max_spawn": 5,
             "default_assignee": "default",
-            "max_in_progress_per_profile": 2,
         }
     }
     monkeypatch.setattr(
         "hermes_cli.config.load_config", lambda: fake_config
+    )
+    # The spark caps are one fleet number: read from the root home, never a profile's own.
+    monkeypatch.setattr(
+        "hermes_cli.kanban_hold._root_kanban_section",
+        lambda: {"max_in_progress_per_profile": 2, "group_caps": {"spark": {"profiles": ["a"], "max": 3}}},
     )
 
     captured = {}
@@ -70,6 +74,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     )
     assert captured.get("default_assignee") == "default"
     assert captured.get("max_in_progress_per_profile") == 2
+    assert captured.get("group_caps") == {"spark": {"profiles": ["a"], "max": 3}}
 
 
 def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):

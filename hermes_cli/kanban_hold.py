@@ -141,6 +141,17 @@ def _root_kanban_section() -> dict:
         return {}
 
 
+def fleet_caps() -> tuple[Any, Any]:
+    """``(max_in_progress_per_profile, group_caps)`` from the root home, never a profile's own.
+
+    The sparks are one shared resource, so their caps are one fleet number. A copy in a
+    profile's ``config.yaml`` silently wins over the root and drifts (three profiles carried a
+    group of 6 while the root said 3), so the dispatcher reads these two keys here only.
+    """
+    section = _root_kanban_section()
+    return section.get("max_in_progress_per_profile"), section.get("group_caps") or None
+
+
 def kanban_policy_cfg() -> dict:
     """The hold keys, current profile first and the root home as the fleet default.
 
