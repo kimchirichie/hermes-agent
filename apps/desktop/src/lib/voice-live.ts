@@ -480,6 +480,19 @@ export class VoiceLiveSession {
     }
   }
 
+  /** Silent reference for later questions: `thinking.append` is never read aloud on arrival
+   *  but the voice may answer from it. Keyed to the delegation that produced it. */
+  reference(delegationId: null | string, content: string): void {
+    for (const chunk of chunkForCommentary(content)) {
+      this.send({
+        content: `[reference, do not speak unless asked] ${chunk}`,
+        delegation_id: delegationId,
+        event_id: this.nextEventId('ref'),
+        type: 'session.thinking.append'
+      })
+    }
+  }
+
   /** Steer the live persona mid-conversation (session-wide). */
   instruct(content: string): void {
     const text = content.trim().slice(0, APPEND_CHAR_LIMIT)

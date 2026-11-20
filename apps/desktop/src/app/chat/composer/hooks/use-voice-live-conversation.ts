@@ -2,7 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { type LiveHistoryMessage, type LiveTranscriptFragment, VoiceLiveSession } from '@/lib/voice-live'
-import { FAILED_LINE, NOT_CONFIRMED_LINE, parseVoiceReply } from '@/lib/voice-live-reply'
+import {
+  FAILED_LINE,
+  isBackchannel,
+  isDetailsRequest,
+  NOT_CONFIRMED_LINE,
+  parseVoiceReply,
+  speakableDetails
+} from '@/lib/voice-live-reply'
 import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -47,6 +54,8 @@ export const PROGRESS_LABEL = '[progress] The request is running. Not done yet.'
  *  not reach the running turn. `think` is never read aloud, and silence lets
  *  the live model claim the request went through (the settle-path lesson). */
 const QUEUED_NOTICE = 'That request is queued for right after the one already running.'
+const NO_DETAILS_NOTICE = 'There are no more details for that one.'
+const BACKCHANNEL_NOTE = 'The user only murmured a fragment while work runs. It is not a request. Say nothing.'
 const UNDELIVERED_NOTICE = 'Sorry, I could not pass that through while the current request is still running.'
 
 interface PendingVoiceResponse {
@@ -192,6 +201,8 @@ export function useVoiceLiveConversation({
   // Last spoken correction wins: a second utterance arriving while the first
   // steer is still in flight supersedes it.
   const steerSeqRef = useRef(0)
+  // The detail card of the last settled reply: chat text and silent reference, spoken only on request.
+  const lastDetailsRef = useRef('')
 
   const latest = useRef({
     activeToolLabel,
@@ -299,6 +310,7 @@ export function useVoiceLiveConversation({
           const id = live()
 
           if (id) {
+            lastDetailsRef.current = ''
             session.speak(id, NOT_CONFIRMED_LINE)
             latest.current.consumePendingResponse()
             setDelegation(null)
@@ -452,6 +464,22 @@ export function useVoiceLiveConversation({
             return
           }
 
+          // "Details" / "say more" speaks the last detail card; it never becomes a turn.
+          if (!busyRef.current && isDetailsRequest(prompt)) {
+            const spoken = speakableDetails(lastDetailsRef.current)
+            session.speak(delegationId, spoken || NO_DETAILS_NOTICE)
+
+            return
+          }
+
+          // A murmur while work runs ("mm", "got it") is not a turn: close the
+          // delegation the voice just opened without a word and without steering.
+          if (busyRef.current && isBackchannel(prompt)) {
+            session.think(delegationId, BACKCHANNEL_NOTE)
+
+            return
+          }
+
           // A newer request while a turn is running is a correction, not a
           // reason to throw work away: it STEERS the running turn — the same
           // policy the text composer follows (`busy_input_mode: steer`).
@@ -472,6 +500,7 @@ export function useVoiceLiveConversation({
           refreshStatus()
           void Promise.resolve(latest.current.onSubmit(prompt, voiceContext)).catch(error => {
             notifyError(error, voiceCopy.liveDelegationFailed)
+            lastDetailsRef.current = ''
             session.speak(delegationId, FAILED_LINE)
             setDelegation(null)
             refreshStatus()
@@ -538,6 +567,7 @@ export function useVoiceLiveConversation({
     }
 
     const settle = (text: string) => {
+      lastDetailsRef.current = ''
       latest.current.consumePendingResponse()
       session.speak(delegationId, text)
       setDelegation(null)
@@ -581,8 +611,13 @@ export function useVoiceLiveConversation({
 
         const reply = parseVoiceReply(response.text)
 
+        if (reply.details) {
+          session.reference(delegationId, reply.details)
+        }
+
         // A directive with no words, or no directive at all, confirms nothing.
         settle(reply.spoken ? reply.spoken : reply.kind === 'failed' ? FAILED_LINE : NOT_CONFIRMED_LINE)
+        lastDetailsRef.current = reply.details
 
         return
       }

@@ -18,7 +18,7 @@ import { delegationPrompt, MAX_SILENT_MS, PROGRESS_LABEL, useVoiceLiveConversati
 const transport = vi.hoisted(() => ({
   failure: null as unknown,
   handlers: [] as VoiceLiveHandlers[],
-  sessions: [] as Array<{ speak: ReturnType<typeof vi.fn>; think: ReturnType<typeof vi.fn> }>
+  sessions: [] as Array<{ reference: ReturnType<typeof vi.fn>; speak: ReturnType<typeof vi.fn>; think: ReturnType<typeof vi.fn> }>
 }))
 
 vi.mock('@/lib/voice-live', async importOriginal => {
@@ -29,6 +29,7 @@ vi.mock('@/lib/voice-live', async importOriginal => {
     VoiceLiveSession: class {
       close = vi.fn()
       instruct = vi.fn()
+      reference = vi.fn()
       setMuted = vi.fn()
       speak = vi.fn()
       think = vi.fn()
@@ -223,7 +224,11 @@ describe('GPT-Live reply contract', () => {
     return {
       handlers: transport.handlers.at(-1) as VoiceLiveHandlers,
       hook,
-      session: transport.sessions.at(-1) as { speak: ReturnType<typeof vi.fn>; think: ReturnType<typeof vi.fn> }
+      session: transport.sessions.at(-1) as {
+        reference: ReturnType<typeof vi.fn>
+        speak: ReturnType<typeof vi.fn>
+        think: ReturnType<typeof vi.fn>
+      }
     }
   }
 
@@ -492,6 +497,86 @@ describe('GPT-Live reply contract', () => {
       'del-second',
       'That request is queued for right after the one already running.'
     )
+  })
+
+  it('keeps the detail card as a silent reference and speaks it only on a details request', async () => {
+    let reply: Reply = null
+    const onSubmit = vi.fn()
+    const { handlers, hook, session } = await open({ onSubmit, reply: () => reply })
+
+    act(() => handlers.onDelegation('del-a', [{ endMs: 1, speaker: 'user', startMs: 0, text: 'quote total' }]))
+    reply = { id: 'r1', pending: false, text: 'DONE: The Taylor ISD quote is ready.\n---\nTotal $4,812.50 on proposal 585, card t_54aa843d' }
+    await advance(400)
+
+    expect(session.speak).toHaveBeenCalledTimes(1)
+    expect(session.speak).toHaveBeenCalledWith('del-a', 'The Taylor ISD quote is ready.')
+    expect(session.reference).toHaveBeenCalledWith('del-a', expect.stringContaining('$4,812.50'))
+
+    reply = null
+    act(() => handlers.onDelegation('del-b', [{ endMs: 2, speaker: 'user', startMs: 1, text: 'details' }]))
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    const detailSpeech = session.speak.mock.calls.filter(([id]) => id === 'del-b').map(([, text]) => text).join(' ')
+    expect(detailSpeech).toContain('4,812.50')
+    expect(detailSpeech).not.toMatch(/585|t_54aa843d/)
+    await act(async () => hook.rerender({ isBusy: false }))
+  })
+
+  it('does not speak an older result\'s details after a turn that failed', async () => {
+    let reply: Reply = null
+    const { handlers, hook, session } = await open({ reply: () => reply })
+
+    act(() => handlers.onDelegation('del-a', [{ endMs: 1, speaker: 'user', startMs: 0, text: 'quote total' }]))
+    reply = { id: 'r1', pending: false, text: 'DONE: The quote is ready.\n---\nTotal $4,812.50' }
+    await advance(400)
+
+    reply = null
+    act(() => handlers.onDelegation('del-b', [{ endMs: 3, speaker: 'user', startMs: 2, text: 'next one' }]))
+    reply = { id: 'r2', interrupted: true, pending: false, text: 'DONE: partly writ' }
+    await advance(400)
+
+    reply = null
+    act(() => handlers.onDelegation('del-c', [{ endMs: 5, speaker: 'user', startMs: 4, text: 'details' }]))
+    const detailSpeech = session.speak.mock.calls.filter(([id]) => id === 'del-c').map(([, text]) => text).join(' ')
+    expect(detailSpeech).not.toContain('4,812')
+    await act(async () => hook.rerender({ isBusy: false }))
+  })
+
+  it('treats a murmur while work runs as no turn: no steer, no speech', async () => {
+    const onSteer = vi.fn(async () => 'steered' as const)
+    const { handlers, hook, session } = await open({ onSteer })
+
+    act(() => handlers.onDelegation('del-first', [{ endMs: 1, speaker: 'user', startMs: 0, text: 'start the import' }]))
+    await act(async () => hook.rerender({ isBusy: true }))
+    session.speak.mockClear()
+
+    for (const text of ['Mm', 'Got it', 'uh', 'journeys', 'yeah okay']) {
+      act(() => handlers.onDelegation(`del-${text}`, [{ endMs: 3, speaker: 'user', startMs: 2, text }]))
+    }
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(session.speak).not.toHaveBeenCalled()
+    expect(session.think).toHaveBeenCalledWith('del-Mm', expect.stringContaining('Say nothing'))
+  })
+
+  it('never speaks a label, an id, or a progress claim next to a result', async () => {
+    let reply: Reply = null
+    const { handlers, session } = await open({ reply: () => reply })
+
+    act(() => handlers.onDelegation('del-c', []))
+    reply = {
+      id: 'r1',
+      pending: false,
+      text: 'DONE: Hermes is working, not done yet. Filed: 1677 as card 584 for the nudge build.\n---\nt_54aa843d'
+    }
+    await advance(400)
+
+    const said = session.speak.mock.calls.map(([, text]) => String(text)).join(' ')
+    expect(said).not.toMatch(/DONE|not done yet|1677|584|t_54aa843d/i)
+    expect(said).toContain('nudge build')
   })
 
   it('still ends the conversation on a spoken stop word while a turn is running', async () => {
