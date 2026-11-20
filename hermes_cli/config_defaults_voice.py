@@ -8,7 +8,7 @@ VOICE_DEFAULTS = {
     #              selected); needs an OpenAI API key. $0.05/min voice layer billing.
     "voice_chat_mode": "chained",
     "gpt_live": {
-        "model": "gpt-live-1",
+        "model": "gpt-live-1.1",
         "voice": "marin",  # marin | quartz | ripple | vesper | willow | stone | gleam | meridian | ...
         # Extra sentences appended to the live model's conversation persona (tone, pacing, language).
         "instructions": "",

@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 GPT_LIVE_MODE = "gpt-live"
 CHAINED_MODE = "chained"
-DEFAULT_LIVE_MODEL = "gpt-live-1"
+DEFAULT_LIVE_MODEL = "gpt-live-1.1"
 DEFAULT_LIVE_VOICE = "marin"
 DEFAULT_LIVE_BASE_URL = "https://api.openai.com/v1"
 # Voices the vendor lists for gpt-live-1 (live-conversations guide) plus the realtime defaults it
