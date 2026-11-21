@@ -68,6 +68,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
         from hermes_cli.kanban_hold import fleet_caps
         max_in_progress_per_profile, group_caps = fleet_caps()
+        from hermes_cli.kanban_router_seed import group_seeds
+        group_seed = group_seeds(group_caps)
         # Memory-derived default when unset — same fallback the gateway applies.
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
@@ -78,7 +80,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
     except Exception:
-        default_assignee = max_in_progress_per_profile = max_in_progress = group_caps = None
+        default_assignee = max_in_progress_per_profile = max_in_progress = group_caps = group_seed = None
         max_spawn = getattr(args, "max", None)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
@@ -90,6 +92,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             group_caps=group_caps,
+            group_seed=group_seed,
         )
     if getattr(args, "json", False):
         _print_json({

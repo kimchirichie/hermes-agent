@@ -152,3 +152,43 @@ def test_seed_dict_is_shared_by_the_watcher(monkeypatch):
     d.tick_once_for_board = lambda slug: seen.append(d.group_seed) or None
     d.tick_once()
     assert seen[0] is seen[1]
+
+
+def test_future_timestamp_is_unreadable(router):
+    router["body"] = _body(1, ts=time.time() + 500)
+    assert rs.read_router_count(router["url"], MODEL) is None
+
+
+def test_bad_max_skips_the_group_instead_of_raising(router):
+    router["body"] = _body(1)
+    caps = {"spark": {"profiles": ["a"], "max": "x", "router_seed": {"url": router["url"], "model": MODEL}}}
+    assert rs.group_seeds(caps) == {}
+
+
+def test_router_seed_true_is_ignored_and_warns_once(caplog):
+    rs._warned_malformed.clear()
+    caps = {"spark": {"profiles": ["a"], "max": 3, "router_seed": True}}
+    with caplog.at_level("WARNING"):
+        assert rs.group_seeds(caps) == {}
+        rs.group_seeds(caps)
+    assert sum("not {url, model}" in r.message for r in caplog.records) == 1
+
+
+def test_out_of_tick_callers_get_caps_and_seed(monkeypatch, router):
+    router["body"] = _body(2)
+    caps = {"spark": {"profiles": ["a"], "max": 3, "router_seed": {"url": router["url"], "model": MODEL}}}
+    monkeypatch.setattr("hermes_cli.kanban_hold.fleet_caps", lambda: (None, caps))
+    got_caps, seed = rs.fleet_group_caps_and_seed()
+    assert got_caps is caps and seed == {"spark": 2}
+
+
+def test_boards_with_the_most_urgent_ready_card_go_first(kbenv):
+    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher
+    kb, kbc, _kbd = kbenv
+    with kbc.connect_closing(board="default") as conn:
+        kb.create_task(conn, title="low", assignee="alpha", priority=0)
+    with kbc.connect_closing(board="other") as conn:
+        kb.create_task(conn, title="high", assignee="alpha", priority=5)
+    d = _KanbanDispatcher.__new__(_KanbanDispatcher)
+    d._board_slugs = lambda: ["default", "other"]
+    assert d._boards_by_urgency() == ["other", "default"]

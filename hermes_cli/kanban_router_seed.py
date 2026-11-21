@@ -16,6 +16,7 @@ import urllib.request
 from typing import Any, Mapping, Optional
 
 logger = logging.getLogger(__name__)
+_warned_malformed: set[str] = set()
 
 MAX_AGE_SECONDS = 120.0
 TIMEOUT_SECONDS = 2.0
@@ -35,8 +36,9 @@ def read_router_count(url: str, model: str, *, now: Optional[float] = None) -> O
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         logger.warning("kanban router seed: bad count %r", count)
         return None
-    if (time.time() if now is None else now) - ts > MAX_AGE_SECONDS:
-        logger.warning("kanban router seed: reading is %.0fs old", (time.time() if now is None else now) - ts)
+    age = (time.time() if now is None else now) - ts
+    if abs(age) > MAX_AGE_SECONDS:
+        logger.warning("kanban router seed: reading is %.0fs off", age)
         return None
     return count
 
@@ -49,8 +51,29 @@ def group_seeds(group_caps: Optional[Mapping[str, Any]]) -> dict[str, int]:
     seeds: dict[str, int] = {}
     for name, spec in (group_caps or {}).items():
         src = spec.get("router_seed") if isinstance(spec, Mapping) else None
+        if src is None:
+            continue
         if not isinstance(src, Mapping) or not src.get("url") or not src.get("model"):
+            if name not in _warned_malformed:
+                _warned_malformed.add(name)
+                logger.warning("kanban router seed: group %r has router_seed but not {url, model}; ignored", name)
+            continue
+        try:
+            cap = int(spec.get("max"))
+        except (TypeError, ValueError):
             continue
         count = read_router_count(str(src["url"]), str(src["model"]))
-        seeds[str(name)] = count if count is not None else int(spec.get("max") or 0)
+        seeds[str(name)] = count if count is not None else cap
     return seeds
+
+
+def fleet_group_caps_and_seed() -> tuple[Optional[Mapping[str, Any]], dict[str, int]]:
+    """``(group_caps, group_seed)`` for a caller that dispatches outside the watcher tick.
+
+    The dashboard nudge and the daemon use this so they obey the same cap and router reading
+    as the gateway tick instead of spawning past it.
+    """
+    from hermes_cli.kanban_hold import fleet_caps
+
+    _per_profile, caps = fleet_caps()
+    return caps, group_seeds(caps)

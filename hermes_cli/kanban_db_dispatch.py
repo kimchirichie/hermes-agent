@@ -3201,12 +3201,16 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            from hermes_cli.kanban_router_seed import fleet_group_caps_and_seed
+            group_caps, group_seed = fleet_group_caps_and_seed()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    group_caps=group_caps,
+                    group_seed=group_seed,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):

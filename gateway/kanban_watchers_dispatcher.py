@@ -227,7 +227,31 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         from hermes_cli.kanban_router_seed import group_seeds
         self.group_seed = group_seeds(self.settings.group_caps)
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        return [(slug, self.tick_once_for_board(slug)) for slug in self._boards_by_urgency()]
+
+    def _boards_by_urgency(self) -> list:
+        """Boards whose best ready card ranks first go first, so a shared slot is not taken by an
+        earlier board's lower-priority card. A board that cannot be read keeps its place at the end."""
+        from hermes_cli import kanban_db as _kb
+
+        def best(slug: str) -> tuple:
+            conn = None
+            try:
+                with _kb.pin_first_board_resolution():
+                    conn = _kbc().connect(board=slug)
+                row = conn.execute(
+                    "SELECT priority, created_at FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
+                    "ORDER BY priority DESC, created_at ASC LIMIT 1").fetchone()
+                return (0, -int(row["priority"] or 0), int(row["created_at"] or 0)) if row else (1, 0, 0)
+            except Exception:
+                return (2, 0, 0)
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+
+        slugs = self._board_slugs()
+        return sorted(slugs, key=best)
 
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
