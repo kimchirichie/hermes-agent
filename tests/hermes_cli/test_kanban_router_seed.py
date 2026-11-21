@@ -177,7 +177,7 @@ def test_router_seed_true_is_ignored_and_warns_once(caplog):
 def test_out_of_tick_callers_get_caps_and_seed(monkeypatch, router):
     router["body"] = _body(2)
     caps = {"spark": {"profiles": ["a"], "max": 3, "router_seed": {"url": router["url"], "model": MODEL}}}
-    monkeypatch.setattr("hermes_cli.kanban_hold.fleet_caps", lambda: (None, caps))
+    monkeypatch.setattr("hermes_cli.kanban_fleet_caps.fleet_caps", lambda: (None, caps))
     got_caps, seed = rs.fleet_group_caps_and_seed()
     assert got_caps is caps and seed == {"spark": 2}
 

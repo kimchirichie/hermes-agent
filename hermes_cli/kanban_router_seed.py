@@ -73,7 +73,7 @@ def fleet_group_caps_and_seed() -> tuple[Optional[Mapping[str, Any]], dict[str, 
     The dashboard nudge and the daemon use this so they obey the same cap and router reading
     as the gateway tick instead of spawning past it.
     """
-    from hermes_cli.kanban_hold import fleet_caps
+    from hermes_cli.kanban_fleet_caps import fleet_caps
 
     _per_profile, caps = fleet_caps()
     return caps, group_seeds(caps)

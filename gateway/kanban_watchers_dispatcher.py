@@ -103,7 +103,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
-    from hermes_cli.kanban_hold import fleet_caps
+    from hermes_cli.kanban_fleet_caps import fleet_caps
     fleet_per_profile, fleet_group_caps = fleet_caps()
 
     return _DispatcherSettings(

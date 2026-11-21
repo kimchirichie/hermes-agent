@@ -1921,26 +1921,6 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
-        # Holding pattern (hermes_cli/kanban_hold.py). A new card assigned to one of these
-        # profiles is created `scheduled` instead of `ready`: it waits for the nightly drain
-        # instead of claiming a worker the moment it is filed. Intended for the cloud lanes
-        # (sandboxes that cost money and can wait overnight); the local and orchestrator lanes
-        # should stay out of this list so they keep running live. [] = no hold, the only safe
-        # default for an install that has not asked for one. Cards whose parent is unfinished
-        # still land `todo`, and only a card that would have run now is deferred.
-        "hold_profiles": None,
-        # A card at or above this priority is never held, so `--priority 8` still means urgent.
-        # None = no priority escapes the hold.
-        "hold_exempt_priority": None,
-        # Never hold a card that continues work already in a PR: the PR would wait a whole day
-        # for its own fix. Matched against `created_by` (the review bridge and the PR event
-        # loop file these) and against a title prefix (the bridge's lane markers).
-        "hold_exempt_creators": None,
-        "hold_exempt_title_prefixes": None,
-        # The drain's own concurrency throttle: how many cards these lanes may have `running`
-        # + `ready` before a tick stops releasing. Deliberately independent of the dispatcher's
-        # max_in_progress / group_caps — those bound the HOST, this paces the queue.
-        "drain_cap": 4,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.

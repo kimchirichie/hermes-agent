@@ -50,7 +50,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     )
     # The spark caps are one fleet number: read from the root home, never a profile's own.
     monkeypatch.setattr(
-        "hermes_cli.kanban_hold._root_kanban_section",
+        "hermes_cli.kanban_fleet_caps._root_kanban_section",
         lambda: {"max_in_progress_per_profile": 2, "group_caps": {"spark": {"profiles": ["a"], "max": 3}}},
     )
 

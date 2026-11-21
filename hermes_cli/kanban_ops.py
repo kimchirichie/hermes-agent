@@ -66,7 +66,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-        from hermes_cli.kanban_hold import fleet_caps
+        from hermes_cli.kanban_fleet_caps import fleet_caps
         max_in_progress_per_profile, group_caps = fleet_caps()
         from hermes_cli.kanban_router_seed import group_seeds
         group_seed = group_seeds(group_caps)
