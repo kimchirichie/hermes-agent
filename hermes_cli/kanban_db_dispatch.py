@@ -2173,6 +2173,11 @@ def resolve_per_profile_cap(value: Any) -> Optional[Callable[[str], Optional[int
     return lambda name: cap
 
 
+# A card at or above this priority ignores the router part of a group's count (still bound by the
+# running-card cap), so a revision or SHIP card is not held behind chat load.
+URGENT_PRIORITY = 8
+
+
 def normalize_group_caps(raw: Any) -> list[tuple[str, frozenset, int]]:
     """Parse ``kanban.group_caps`` into ``[(name, profiles, max)]``.
 
@@ -2232,6 +2237,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Any = None,
     group_caps: Optional[Mapping[str, Any]] = None,
+    group_seed: Optional[Mapping[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -2256,6 +2262,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             group_caps=group_caps,
+            group_seed=group_seed,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -2308,6 +2315,7 @@ def _dispatch_lane_task(
     per_profile_running: dict[str, int],
     groups: Optional[list] = None,
     group_running: Optional[dict] = None,
+    group_cards_running: Optional[dict] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2342,9 +2350,13 @@ def _dispatch_lane_task(
         result.skipped_per_profile_capped.append((task_id, assignee, current))
         return False
     for gname, members, gcap in (groups or ()):
-        if assignee in members and (group_running or {}).get(gname, 0) >= gcap:
-            result.skipped_per_profile_capped.append(
-                (task_id, assignee, (group_running or {}).get(gname, 0)))
+        if assignee not in members:
+            continue
+        used = (group_running or {}).get(gname, 0)
+        if (group_cards_running or {}).get(gname) is not None and _row_priority(row) >= URGENT_PRIORITY:
+            used = group_cards_running[gname]
+        if used >= gcap:
+            result.skipped_per_profile_capped.append((task_id, assignee, used))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
@@ -2369,6 +2381,8 @@ def _dispatch_lane_task(
         for gname, members, _gcap in (groups or ()):
             if name in members and group_running is not None:
                 group_running[gname] = group_running.get(gname, 0) + 1
+                if group_cards_running is not None and gname in group_cards_running:
+                    group_cards_running[gname] += 1
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
@@ -2529,10 +2543,14 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
+def _row_priority(row: sqlite3.Row) -> int:
+    return int(row["priority"] or 0) if "priority" in row.keys() else 0
+
+
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, priority FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2626,6 +2644,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Any = None,
     group_caps: Optional[Mapping[str, Any]] = None,
+    group_seed: Optional[Mapping[str, int]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -2665,12 +2684,14 @@ def _dispatch_once_locked(
     # the same local model server) share ONE budget across all boards.
     groups = normalize_group_caps(group_caps)
     group_running: dict[str, int] = {}
+    group_cards_running: dict[str, int] = {}
     if groups:
         combined = running_by_assignee(conn)
         for name, n in running_by_assignee_other_boards(board).items():
             combined[name] = combined.get(name, 0) + n
         for gname, members, _gcap in groups:
-            group_running[gname] = sum(n for who, n in combined.items() if who in members)
+            group_cards_running[gname] = sum(n for who, n in combined.items() if who in members)
+            group_running[gname] = max(group_cards_running[gname], int((group_seed or {}).get(gname, 0)))
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2685,7 +2706,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-        groups=groups, group_running=group_running,
+        groups=groups, group_running=group_running, group_cards_running=group_cards_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

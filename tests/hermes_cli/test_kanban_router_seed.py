@@ -1,0 +1,120 @@
+"""A group cap starts at max(running cards, router in-flight count); unreadable means full."""
+from __future__ import annotations
+
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import pytest
+
+from hermes_cli import kanban_router_seed as rs
+from tests.hermes_cli.test_kanban_group_caps import GROUP, _dry, kbenv
+
+MODEL = "spark-box:deepseek-flash"
+
+
+@pytest.fixture()
+def router():
+    state = {"body": None, "status": 200}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(state["status"])
+            self.end_headers()
+            self.wfile.write(json.dumps(state["body"]).encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    state["url"] = f"http://127.0.0.1:{srv.server_port}/spark/inflight"
+    yield state
+    srv.shutdown()
+
+
+def _body(n, ts=None):
+    return {"in_flight": n, "groups": {MODEL: n}, "ts": time.time() if ts is None else ts}
+
+
+def test_reads_fresh_count(router):
+    router["body"] = _body(2)
+    assert rs.read_router_count(router["url"], MODEL) == 2
+
+
+@pytest.mark.parametrize("body", [
+    {"in_flight": 1, "groups": {}, "ts": 1e18},
+    {"groups": {MODEL: "x"}, "ts": 1e18},
+    {"groups": {MODEL: -1}, "ts": 1e18},
+    {"groups": {MODEL: True}, "ts": 1e18},
+    "garbage",
+])
+def test_bad_body_is_unreadable(router, body):
+    router["body"] = body
+    assert rs.read_router_count(router["url"], MODEL) is None
+
+
+def test_stale_reading_is_unreadable(router):
+    router["body"] = _body(1, ts=time.time() - 500)
+    assert rs.read_router_count(router["url"], MODEL) is None
+
+
+def test_unreachable_is_unreadable():
+    assert rs.read_router_count("http://127.0.0.1:9/x", MODEL) is None
+
+
+def test_group_seeds_unreadable_seeds_the_group_full(router):
+    router["status"] = 500
+    caps = {"spark": {"profiles": ["a"], "max": 3, "router_seed": {"url": router["url"], "model": MODEL}}}
+    assert rs.group_seeds(caps) == {"spark": 3}
+
+
+def test_group_without_router_seed_is_untouched():
+    assert rs.group_seeds({"spark": {"profiles": ["a"], "max": 3}}) == {}
+
+
+def test_router_count_above_cards_blocks_spawns(kbenv):
+    kb, kbc, kbd = kbenv
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+    res = _dry(kbd, kbc, group_caps=GROUP, group_seed={"spark": 2})
+    assert res.spawned == []
+
+
+def test_router_count_below_cards_does_not_loosen(kbenv):
+    kb, kbc, kbd = kbenv
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+    res = _dry(kbd, kbc, group_caps=GROUP, group_seed={"spark": 0})
+    assert len(res.spawned) == 2
+
+
+def test_partial_router_load_leaves_the_remainder(kbenv):
+    kb, kbc, kbd = kbenv
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+    res = _dry(kbd, kbc, group_caps=GROUP, group_seed={"spark": 1})
+    assert len(res.spawned) == 1
+
+
+def test_urgent_card_ignores_the_router_but_not_the_card_cap(kbenv):
+    kb, kbc, kbd = kbenv
+    with kbc.connect_closing() as conn:
+        urgent = kb.create_task(conn, title="rev", assignee="alpha", priority=8)
+        kb.create_task(conn, title="normal", assignee="alpha", priority=0)
+    res = _dry(kbd, kbc, group_caps=GROUP, group_seed={"spark": 2})
+    assert [t[0] for t in res.spawned] == [urgent]
+
+
+def test_refused_card_does_not_take_a_slot(kbenv):
+    kb, kbc, kbd = kbenv
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"g{i}", assignee="gamma")
+        kb.create_task(conn, title="a", assignee="alpha")
+    res = _dry(kbd, kbc, group_caps=GROUP, group_seed={"spark": 1})
+    assert len(res.spawned) >= 1
