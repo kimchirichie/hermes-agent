@@ -2316,6 +2316,7 @@ def _dispatch_lane_task(
     groups: Optional[list] = None,
     group_running: Optional[dict] = None,
     group_cards_running: Optional[dict] = None,
+    group_seed: Optional[dict] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2383,6 +2384,8 @@ def _dispatch_lane_task(
                 group_running[gname] = group_running.get(gname, 0) + 1
                 if group_cards_running is not None and gname in group_cards_running:
                     group_cards_running[gname] += 1
+                if group_seed is not None and gname in group_seed:
+                    group_seed[gname] += 1
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
@@ -2707,6 +2710,7 @@ def _dispatch_once_locked(
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
         groups=groups, group_running=group_running, group_cards_running=group_cards_running,
+        group_seed=group_seed,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

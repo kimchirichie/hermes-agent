@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from hermes_cli import kanban_router_seed as rs
-from tests.hermes_cli.test_kanban_group_caps import GROUP, _dry, kbenv
+from tests.hermes_cli.test_kanban_group_caps import GROUP, _dry, _mark_running, kbenv
 
 MODEL = "spark-box:deepseek-flash"
 
@@ -118,3 +118,37 @@ def test_refused_card_does_not_take_a_slot(kbenv):
         kb.create_task(conn, title="a", assignee="alpha")
     res = _dry(kbd, kbc, group_caps=GROUP, group_seed={"spark": 1})
     assert len(res.spawned) >= 1
+
+
+def test_seed_is_used_up_across_boards(kbenv):
+    kb, kbc, kbd = kbenv
+    for board in ("default", "other"):
+        with kbc.connect_closing(board=board) as conn:
+            for i in range(3):
+                kb.create_task(conn, title=f"{board}{i}", assignee="alpha")
+    seed = {"spark": 1}
+    spawned = 0
+    for board in ("default", "other"):
+        with kbc.connect_closing(board=board) as conn:
+            res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 12345, board=board,
+                                    group_caps=GROUP, group_seed=seed)
+            spawned += len(res.spawned)
+            for task_id, _who, _ws in res.spawned:
+                _mark_running(kb, kbc, board, task_id)
+    assert spawned == 1
+
+
+def test_seed_dict_is_shared_by_the_watcher(monkeypatch):
+    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher
+    seen = []
+
+    class FakeKb:
+        pass
+
+    d = _KanbanDispatcher.__new__(_KanbanDispatcher)
+    d.settings = type("S", (), {"group_caps": None})()
+    d.group_seed = {}
+    d._board_slugs = lambda: ["a", "b"]
+    d.tick_once_for_board = lambda slug: seen.append(d.group_seed) or None
+    d.tick_once()
+    assert seen[0] is seen[1]
