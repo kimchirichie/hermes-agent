@@ -23,6 +23,7 @@ from typing import Callable
 from typing import Iterable
 from typing import Iterator
 from typing import Mapping
+from typing import NamedTuple
 from typing import Optional
 from typing import TYPE_CHECKING
 
@@ -2121,6 +2122,27 @@ def running_by_assignee_other_boards(board: Optional[str] = None) -> dict[str, i
     return totals
 
 
+def running_by_assignee_model(conn: sqlite3.Connection) -> dict[tuple[str, Optional[str]], int]:
+    """``running`` task count per ``(assignee, model_override)`` on one board."""
+    return {
+        (row["assignee"], row["model_override"] or None): int(row["n"])
+        for row in conn.execute(
+            "SELECT assignee, model_override, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee, model_override"
+        )
+    }
+
+
+def running_by_assignee_model_other_boards(board: Optional[str] = None) -> dict[tuple[str, Optional[str]], int]:
+    """:func:`running_by_assignee_model` summed across every board EXCEPT ``board``."""
+    totals: dict[tuple[str, Optional[str]], int] = {}
+    for counts in _for_other_boards(board, running_by_assignee_model):
+        for key, n in counts.items():
+            totals[key] = totals.get(key, 0) + n
+    return totals
+
+
 def _for_other_boards(board: Optional[str], fn: Callable[[sqlite3.Connection], Any]) -> list[Any]:
     """``fn(conn)`` for every board DB except ``board``'s; fails open per board."""
     try:
@@ -2178,19 +2200,30 @@ def resolve_per_profile_cap(value: Any) -> Optional[Callable[[str], Optional[int
 URGENT_PRIORITY = 8
 
 
-def normalize_group_caps(raw: Any) -> list[tuple[str, frozenset, int]]:
-    """Parse ``kanban.group_caps`` into ``[(name, profiles, max)]``.
+class GroupCap(NamedTuple):
+    name: str
+    model: Optional[str]
+    profiles: frozenset
+    max: int
 
-    Accepts ``{name: {"profiles": [...], "max": N}}``. Invalid entries are
-    dropped; a group whose ``max`` is below 1 or whose profile list is empty
-    is ignored rather than blocking every spawn.
+
+def normalize_group_caps(raw: Any) -> list[GroupCap]:
+    """Parse ``kanban.group_caps`` into :class:`GroupCap` entries.
+
+    Accepts ``{name: {"model": "<model>", "max": N}}``: a card belongs to the group when its
+    effective model (its ``model_override``, else its assignee profile's default model) equals
+    ``model``. ``profiles: [...]`` is the deprecated fallback when no ``model`` is set. Invalid
+    entries are dropped; a group whose ``max`` is below 1 or that names no model and no
+    profile is ignored rather than blocking every spawn.
     """
-    out: list[tuple[str, frozenset, int]] = []
+    out: list[GroupCap] = []
     if not isinstance(raw, Mapping):
         return out
     for name, spec in raw.items():
         if not isinstance(spec, Mapping):
             continue
+        model = spec.get("model")
+        model = model.strip() if isinstance(model, str) and model.strip() else None
         profiles = spec.get("profiles")
         if isinstance(profiles, str):
             profiles = [p.strip() for p in profiles.split(",")]
@@ -2199,9 +2232,31 @@ def normalize_group_caps(raw: Any) -> list[tuple[str, frozenset, int]]:
         except (TypeError, ValueError):
             continue
         members = frozenset(p for p in (profiles or []) if isinstance(p, str) and p)
-        if cap >= 1 and members:
-            out.append((str(name), members, cap))
+        if cap >= 1 and (model or members):
+            out.append(GroupCap(str(name), model, members, cap))
     return out
+
+
+def _profile_default_model(profile: str) -> Optional[str]:
+    """The profile's configured default model, ``None`` when unreadable."""
+    try:
+        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.profiles import get_profile_dir
+
+        model = read_user_config_raw(get_profile_dir(profile) / "config.yaml").get("model")
+    except Exception:
+        return None
+    if isinstance(model, Mapping):
+        model = model.get("default") or model.get("model")
+    return model.strip() if isinstance(model, str) and model.strip() else None
+
+
+def _in_group(group: GroupCap, assignee: str, model_override: Optional[str], defaults: dict) -> bool:
+    if group.model is None:
+        return assignee in group.profiles
+    if not model_override and assignee not in defaults:
+        defaults[assignee] = _profile_default_model(assignee)
+    return (model_override or defaults[assignee]) == group.model
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -2350,9 +2405,11 @@ def _dispatch_lane_task(
         current = per_profile_running.get(assignee, 0)
         result.skipped_per_profile_capped.append((task_id, assignee, current))
         return False
-    for gname, members, gcap in (groups or ()):
-        if assignee not in members:
+    model_defaults: dict = {}
+    for group in (groups or ()):
+        if not _in_group(group, assignee, row["model_override"], model_defaults):
             continue
+        gname, gcap = group.name, group.max
         used = (group_running or {}).get(gname, 0)
         if (group_cards_running or {}).get(gname) is not None and _row_priority(row) >= URGENT_PRIORITY:
             used = group_cards_running[gname]
@@ -2374,13 +2431,14 @@ def _dispatch_lane_task(
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
-    def _count_spawn(name: str) -> None:
+    def _count_spawn(name: str, model_override: Optional[str]) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
         if per_profile_cap is not None and name:
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
-        for gname, members, _gcap in (groups or ()):
-            if name in members and group_running is not None:
+        for group in (groups or ()):
+            gname = group.name
+            if group_running is not None and _in_group(group, name, model_override, model_defaults):
                 group_running[gname] = group_running.get(gname, 0) + 1
                 if group_cards_running is not None and gname in group_cards_running:
                     group_cards_running[gname] += 1
@@ -2389,7 +2447,7 @@ def _dispatch_lane_task(
 
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
-        _count_spawn(assignee)
+        _count_spawn(assignee, row["model_override"])
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task  # reassigned since the gates: CAS loses (#147534)
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee)
@@ -2433,7 +2491,7 @@ def _dispatch_lane_task(
         # spawn would let a task that keeps timing out loop forever. Cleared
         # only on successful completion (complete_task).
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-        _count_spawn(claimed.assignee)
+        _count_spawn(claimed.assignee, claimed.model_override)
         return True
     except Exception as exc:
         from tools.process_registry import RestartSafeScopeUnavailable
@@ -2553,7 +2611,7 @@ def _row_priority(row: sqlite3.Row) -> int:
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee, priority FROM tasks "
+        "SELECT id, assignee, priority, model_override FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2689,12 +2747,15 @@ def _dispatch_once_locked(
     group_running: dict[str, int] = {}
     group_cards_running: dict[str, int] = {}
     if groups:
-        combined = running_by_assignee(conn)
-        for name, n in running_by_assignee_other_boards(board).items():
-            combined[name] = combined.get(name, 0) + n
-        for gname, members, _gcap in groups:
-            group_cards_running[gname] = sum(n for who, n in combined.items() if who in members)
-            group_running[gname] = max(group_cards_running[gname], int((group_seed or {}).get(gname, 0)))
+        combined = running_by_assignee_model(conn)
+        for key, n in running_by_assignee_model_other_boards(board).items():
+            combined[key] = combined.get(key, 0) + n
+        model_defaults: dict = {}
+        for group in groups:
+            group_cards_running[group.name] = sum(
+                n for (who, model), n in combined.items() if _in_group(group, who, model, model_defaults)
+            )
+            group_running[group.name] = max(group_cards_running[group.name], int((group_seed or {}).get(group.name, 0)))
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold

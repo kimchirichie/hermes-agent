@@ -97,5 +97,70 @@ def test_normalize_drops_invalid_entries():
         "junk": "x",
         "nomax": {"profiles": ["a"]},
     })
-    assert out == [("ok", frozenset({"a", "b"}), 3)]
+    assert out == [kbd.GroupCap("ok", None, frozenset({"a", "b"}), 3)]
     assert kbd.normalize_group_caps(None) == []
+
+
+SPARK = "spark-box:deepseek-flash"
+BY_MODEL = {"spark": {"model": SPARK, "max": 2}}
+
+
+@pytest.fixture()
+def profile_models(monkeypatch, kbenv):
+    defaults: dict = {}
+    monkeypatch.setattr(kbenv[2], "_profile_default_model", lambda name: defaults.get(name))
+    return defaults
+
+
+def test_cloud_card_on_a_spark_profile_does_not_count(kbenv, profile_models):
+    kb, kbc, kbd = kbenv
+    profile_models["alpha"] = SPARK
+    with kbc.connect_closing() as conn:
+        for i in range(2):
+            t = kb.create_task(conn, title=f"c{i}", assignee="alpha", model_override="dario:sonnet")
+            _mark_running(kb, kbc, "default", t)
+        for i in range(3):
+            kb.create_task(conn, title=f"s{i}", assignee="alpha")
+    res = _dry(kbd, kbc, group_caps=BY_MODEL, reconcile_orphans=False)
+    assert len(res.spawned) == 2
+
+
+def test_spark_card_on_any_profile_counts(kbenv, profile_models):
+    kb, kbc, kbd = kbenv
+    profile_models["beta"] = "dario:sonnet"
+    with kbc.connect_closing() as conn:
+        for i in range(2):
+            t = kb.create_task(conn, title=f"g{i}", assignee="gamma", model_override=SPARK)
+            _mark_running(kb, kbc, "default", t)
+        kb.create_task(conn, title="next", assignee="beta", model_override=SPARK)
+    res = _dry(kbd, kbc, group_caps=BY_MODEL, reconcile_orphans=False)
+    assert res.spawned == []
+    assert len(res.skipped_per_profile_capped) == 1
+
+
+def test_unset_model_resolves_via_profile_default(kbenv, profile_models):
+    kb, kbc, kbd = kbenv
+    profile_models["alpha"] = SPARK
+    profile_models["beta"] = "dario:sonnet"
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            kb.create_task(conn, title=f"b{i}", assignee="beta")
+    res = _dry(kbd, kbc, group_caps=BY_MODEL, reconcile_orphans=False)
+    assert sorted(a for _, a, _ in res.spawned) == ["alpha", "alpha", "beta", "beta", "beta"]
+
+
+@pytest.mark.parametrize("model_cfg,expected", [
+    ({"default": SPARK}, SPARK),
+    ({"model": "m"}, "m"),
+    (SPARK, SPARK),
+    ({}, None),
+    (None, None),
+])
+def test_profile_default_model_parsing(monkeypatch, model_cfg, expected):
+    import hermes_cli.config as cfg
+    from hermes_cli import profiles
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr(cfg, "read_user_config_raw", lambda path: {"model": model_cfg})
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda name: __import__("pathlib").Path("/x") / name)
+    assert kbd._profile_default_model("alpha") == expected
