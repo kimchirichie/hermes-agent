@@ -192,3 +192,12 @@ def test_boards_with_the_most_urgent_ready_card_go_first(kbenv):
     d = _KanbanDispatcher.__new__(_KanbanDispatcher)
     d._board_slugs = lambda: ["default", "other"]
     assert d._boards_by_urgency() == ["other", "default"]
+
+
+def test_router_seed_still_takes_the_max_for_a_model_group(kbenv):
+    kb, kbc, kbd = kbenv
+    with kbc.connect_closing() as conn:
+        for i in range(3):
+            kb.create_task(conn, title=f"m{i}", assignee="alpha", model_override=MODEL)
+    res = _dry(kbd, kbc, group_caps={"spark": {"model": MODEL, "max": 2}}, group_seed={"spark": 1})
+    assert len(res.spawned) == 1
